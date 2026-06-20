@@ -2097,12 +2097,24 @@ fn load_gpu_counter_graph_catalog() -> RawCounterGraphCatalog {
 }
 
 fn gpu_counter_graph_paths() -> Vec<PathBuf> {
-    [
-        "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/Versions/A/Resources/GPUCounterGraph.plist",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect()
+    const REL: &str = "PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/Versions/A/Resources/GPUCounterGraph.plist";
+    let mut paths = Vec::new();
+    // Prefer the active developer dir (`xcode-select -p` → `<app>/Contents/Developer`;
+    // strip `/Developer`), so Xcode-beta / a `DEVELOPER_DIR` override is honored.
+    if let Some(contents) = std::process::Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| PathBuf::from(s.trim()))
+        .and_then(|dev| dev.parent().map(|p| p.to_path_buf()))
+    {
+        paths.push(contents.join(REL));
+    }
+    // Stock fallback.
+    paths.push(PathBuf::from(format!("/Applications/Xcode.app/Contents/{REL}")));
+    paths
 }
 
 fn add_gpu_counter_graph_catalog(path: &Path, catalog: &mut RawCounterGraphCatalog) {

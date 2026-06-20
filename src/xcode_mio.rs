@@ -2564,8 +2564,35 @@ mod platform {
     const RTLD_NOW: c_int = 0x2;
     const RTLD_GLOBAL: c_int = 0x8;
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
-    const GT_SHADER_PROFILER_FRAMEWORK: &str = "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/Versions/A/GTShaderProfiler";
-    const MTL_TOOLS_SHADER_PROFILER_FRAMEWORK: &str = "/Applications/Xcode.app/Contents/SharedFrameworks/MTLToolsShaderProfiler.framework/Versions/A/MTLToolsShaderProfiler";
+    /// `<Xcode.app>/Contents`, resolved from the active developer dir via
+    /// `xcode-select -p` (which honors `DEVELOPER_DIR` and points at Xcode-beta
+    /// when that's selected). Falls back to the stock `/Applications/Xcode.app`.
+    fn xcode_contents_dir() -> std::path::PathBuf {
+        std::process::Command::new("xcode-select")
+            .arg("-p")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| std::path::PathBuf::from(s.trim()))
+            // `xcode-select -p` → `<app>/Contents/Developer`; strip `/Developer`.
+            .and_then(|dev| dev.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("/Applications/Xcode.app/Contents"))
+    }
+
+    fn gt_shader_profiler_framework() -> String {
+        xcode_contents_dir()
+            .join("PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/Versions/A/GTShaderProfiler")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn mtl_tools_shader_profiler_framework() -> String {
+        xcode_contents_dir()
+            .join("SharedFrameworks/MTLToolsShaderProfiler.framework/Versions/A/MTLToolsShaderProfiler")
+            .to_string_lossy()
+            .into_owned()
+    }
 
     unsafe extern "C" {
         fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
@@ -2603,7 +2630,7 @@ mod platform {
         mut timings: XcodeMioTimings,
         options: XcodeMioDecodeOptions,
     ) -> Result<XcodeMioReport> {
-        let framework_path = PathBuf::from(GT_SHADER_PROFILER_FRAMEWORK);
+        let framework_path = PathBuf::from(gt_shader_profiler_framework());
         let silence = FdSilencer::new();
         let framework_start = Instant::now();
         let mut runtime = unsafe { Runtime::load()? };
@@ -3059,8 +3086,8 @@ mod platform {
     impl Runtime {
         unsafe fn load() -> Result<Self> {
             unsafe {
-                let _ = load_framework(MTL_TOOLS_SHADER_PROFILER_FRAMEWORK);
-                load_framework(GT_SHADER_PROFILER_FRAMEWORK)?;
+                let _ = load_framework(&mtl_tools_shader_profiler_framework());
+                load_framework(&gt_shader_profiler_framework())?;
                 let pool_class = lookup_class("NSAutoreleasePool")?;
                 let pool = send_id(send_id(pool_class, "alloc")?, "init")?;
                 Ok(Self { pool })

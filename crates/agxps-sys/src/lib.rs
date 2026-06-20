@@ -343,7 +343,24 @@ pub struct AgxpsApi {
 unsafe impl Send for AgxpsApi {}
 unsafe impl Sync for AgxpsApi {}
 
-const DEFAULT_FRAMEWORK_PATH: &str = "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
+/// Resolve `GTShaderProfiler` from the active developer dir (`xcode-select -p`,
+/// which honors `DEVELOPER_DIR` and points at Xcode-beta when selected), falling
+/// back to the stock `/Applications/Xcode.app`. Overridden by `AGXPS_FRAMEWORK_PATH`.
+fn default_framework_path() -> String {
+    const REL: &str =
+        "PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
+    std::process::Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        // `xcode-select -p` → `<app>/Contents/Developer`; strip `/Developer`.
+        .and_then(|dev| dev.parent().map(|p| p.to_path_buf()))
+        .map(|contents| contents.join(REL).to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("/Applications/Xcode.app/Contents/{REL}"))
+}
 
 /// dlopen `GTShaderProfiler` and dlsym every needed symbol. Returns
 /// [`Error::MissingSymbol`] if any required entry-point isn't exported
@@ -354,7 +371,7 @@ const DEFAULT_FRAMEWORK_PATH: &str = "/Applications/Xcode.app/Contents/PlugIns/G
 /// location (e.g. for Xcode-beta.app or a custom toolchain).
 pub fn load() -> Result<LoadedApi> {
     let path = std::env::var("AGXPS_FRAMEWORK_PATH")
-        .unwrap_or_else(|_| DEFAULT_FRAMEWORK_PATH.to_string());
+        .unwrap_or_else(|_| default_framework_path());
     let cpath = CString::new(path.clone()).unwrap();
     let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if handle.is_null() {
