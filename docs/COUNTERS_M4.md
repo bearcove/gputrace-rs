@@ -87,6 +87,10 @@ Decoding is Xcode's own: `agxps` in `GTShaderProfiler.framework`
    unclaimed clique group whose first clique starts closest to the command
    start (`match_commands`); the command's program address then names the
    dispatch via step 2.
+   Most work cliques carry no launch index at all (`esl_index` all ones):
+   only the first clique(s) after a launch on a core are tagged. An untagged
+   clique belongs to the command of its kick that started last before it on
+   that core.
 5. **Clique ends.** The limiter pass does not trace clique ends. A missing
    end is trusted as a duration only when the slot is handed straight to
    another clique of the same command; any other end is capped at that
@@ -107,6 +111,12 @@ Decoding is Xcode's own: `agxps` in `GTShaderProfiler.framework`
    gives the time.
 8. **Kernels** are dispatch accumulations summed by kernel name (from the
    profiler's dispatch table), or by kernel program address when unnamed.
+
+`counters.md` columns: `gpu_us` is the time a row had work resident
+(concurrent rows overlap, so kernel `gpu_us` can add up to more than the
+encoders' time); `core%` is the row's share of shader-core samples and adds up
+to 100 % over a table, so it is the exclusive share; `disp` is
+`reported/total` when the timing analyzer did not report every dispatch.
 
 Per-encoder rows are exact up to the foreign-kick caveat: every sample of the
 encoder's kicks is the encoder's. Per-dispatch rows are exact when a
@@ -213,6 +223,21 @@ expected bytes again.
 - **Concurrent dispatches.** Per-dispatch values for dispatches that overlap
   on the same cores are a residency split, not a measurement; `shrd%` says how
   much of a row that is.
+- **Dispatches the timing analyzer does not report.** On MLX captures the
+  analyzer reports ~70 % of the dispatches (474 of 674 for a 1-row decoder
+  forward, 785 of 1121 for 32 rows); the others have no shader-launch clique
+  on any core in the limiter pass, so their work is credited to the dispatch
+  that started before them on the same core. Encoder rows are unaffected;
+  kernel and dispatch rows of kernels next to unreported dispatches absorb
+  their neighbours' work (e.g. a split-K `col_reduce` that follows an
+  unreported `qmm` shows the `qmm`'s F32 instruction count). `disp` shows
+  `reported/total`. Why the launches are missing is not known.
+- **Driver threadgroup-optimization programs.** `Program Address Mappings`
+  also lists `driver-tg-opt` / `driver-tg-opt-sl` programs. Each `-sl` is
+  created just before the `compute-sl` of the dispatch it serves (adjacent
+  `binaryUniqueId`s) but is filed under the encoder's first dispatch; they run
+  in small separate kicks between encoders, which have no `TraceId to
+  BatchId` entry and so count as kicks not from this capture.
 - **RDE ring semantics.** Rings of one RDE source are summed as instances of
   the same block. This matches the DRAM oracles; it has not been checked for
   the texture/RDE counters that compute kernels do not exercise.
