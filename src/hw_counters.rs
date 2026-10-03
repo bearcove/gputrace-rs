@@ -1219,7 +1219,13 @@ fn attribute(
             accum.add_counts(stream, sample, *share, shared_encoders);
             let ticks = kick_overlap.get(kick).copied().unwrap_or(0) as f64;
             accum.add_time(cycles * ticks / duration, ticks * timebase_ns * 1e-9);
-            let kick_residency = residency.get(kick).copied().unwrap_or(0);
+            // Cliques that map to no dispatch (driver and profiler programs)
+            // decide the kick's share but not the split between dispatches.
+            let kick_residency = by_dispatch
+                .iter()
+                .filter(|((owner_kick, _), _)| owner_kick == kick)
+                .map(|(_, (resident, _))| *resident)
+                .sum::<u64>();
             if kick_residency == 0 {
                 continue;
             }
