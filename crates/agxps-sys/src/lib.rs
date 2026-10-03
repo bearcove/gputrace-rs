@@ -17,6 +17,8 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod counters;
+
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_void};
 use std::os::raw::c_uchar;
 use std::path::Path;
@@ -39,6 +41,10 @@ pub enum Error {
     KickAccess,
     #[error("missing symbol in framework: {0}")]
     MissingSymbol(&'static str),
+    #[error("agxps_initialize failed for gpu generation {generation} variant {variant}")]
+    CounterInitialize { generation: u32, variant: u32 },
+    #[error("derived counter computation failed: {0}")]
+    CounterCompute(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -149,34 +155,6 @@ pub type FnGetCounterNames = unsafe extern "C" fn(
     count: u64,
 ) -> c_int;
 
-/// `get_counter_values_by_index(pd, uint64_t** out, uint32_t idx) -> int`
-/// — writes the *start pointer* of counter `idx`'s values vector into
-/// `*out`. Read `*out`[0..N] to get the actual u64 values, where N is
-/// from `get_counter_values_num_by_index`.
-pub type FnGetCounterValuesByIndex =
-    unsafe extern "C" fn(pd: AgxpsApsProfileData, out_ptr: *mut *const u64, idx: u32) -> c_int;
-
-/// `get_counter_values_num_by_index(pd, uint64_t* out, uint32_t idx) -> int`
-pub type FnGetCounterValuesNumByIndex =
-    unsafe extern "C" fn(pd: AgxpsApsProfileData, out: *mut u64, idx: u32) -> c_int;
-
-/// `get_counter_values(pd, uint64_t** out, agxps_counter_ident_t ident, uint32_t count) -> int`
-/// — the variant used by Xcode's `XRGPUAPSDataProcessor::loadAPSCounters`.
-pub type FnGetCounterValues = unsafe extern "C" fn(
-    pd: AgxpsApsProfileData,
-    out_ptr: *mut *const u64,
-    ident: c_uint,
-    count: u32,
-) -> c_int;
-
-/// `get_counter_values_num(pd, uint64_t* out, agxps_counter_ident_t ident, uint32_t count) -> int`
-pub type FnGetCounterValuesNum = unsafe extern "C" fn(
-    pd: AgxpsApsProfileData,
-    out: *mut u64,
-    ident: c_uint,
-    count: u32,
-) -> c_int;
-
 /// `agxps_load_counter_obfuscation_map(const char* path) -> int` — load
 /// a two-column CSV counter-name map. Rows are `readable,obfuscated`.
 /// Passing `NULL` asks the framework for
@@ -198,8 +176,6 @@ pub type FnDeobfuscateName = unsafe extern "C" fn(obfuscated: *const c_char) -> 
 /// unchanged if no mapping exists / map not loaded.
 pub type FnObfuscatedName = unsafe extern "C" fn(readable: *const c_char) -> *const c_char;
 
-/// `agxps_counter_get_ident(const char* obfuscated_or_readable) -> agxps_counter_ident_t`.
-pub type FnCounterGetIdent = unsafe extern "C" fn(name: *const c_char) -> c_uint;
 
 /// `agxps_aps_kick_time_stats_create(pd, timestamp_kind, start_kind, end_kind, filter_block)`.
 ///
@@ -292,15 +268,10 @@ pub struct AgxpsApi {
     pub get_esl_clique_clique_id: FnGetU8Range,
     pub get_esl_clique_instruction_trace: FnGetU64Range,
     pub get_counter_names: FnGetCounterNames,
-    pub get_counter_values: FnGetCounterValues,
-    pub get_counter_values_num: FnGetCounterValuesNum,
-    pub get_counter_values_by_index: FnGetCounterValuesByIndex,
-    pub get_counter_values_num_by_index: FnGetCounterValuesNumByIndex,
     pub load_obfuscation_map: FnLoadObfuscationMap,
     pub unload_obfuscation_map: FnUnloadObfuscationMap,
     pub deobfuscate_name: FnDeobfuscateName,
     pub obfuscated_name: FnObfuscatedName,
-    pub counter_get_ident: FnCounterGetIdent,
     pub kick_time_stats_create: FnKickTimeStatsCreate,
     pub kick_time_stats_create_sampled: FnKickTimeStatsCreateSampled,
     pub stats_destroy: FnStatsDestroy,
@@ -362,16 +333,14 @@ fn default_framework_path() -> String {
         .unwrap_or_else(|| format!("/Applications/Xcode.app/Contents/{REL}"))
 }
 
-/// dlopen `GTShaderProfiler` and dlsym every needed symbol. Returns
-/// [`Error::MissingSymbol`] if any required entry-point isn't exported
-/// (which would mean we're looking at an Xcode version with a renamed
-/// or missing function — worth flagging early).
-///
-/// Set `AGXPS_FRAMEWORK_PATH` env var to override the default Xcode
-/// location (e.g. for Xcode-beta.app or a custom toolchain).
-pub fn load() -> Result<LoadedApi> {
-    let path = std::env::var("AGXPS_FRAMEWORK_PATH")
-        .unwrap_or_else(|_| default_framework_path());
+fn framework_path() -> String {
+    std::env::var("AGXPS_FRAMEWORK_PATH").unwrap_or_else(|_| default_framework_path())
+}
+
+/// dlopen `GTShaderProfiler` (a no-op returning the same handle when it is
+/// already loaded).
+pub(crate) fn open_framework() -> Result<*mut c_void> {
+    let path = framework_path();
     let cpath = CString::new(path.clone()).unwrap();
     let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if handle.is_null() {
@@ -380,6 +349,23 @@ pub fn load() -> Result<LoadedApi> {
             .into_owned();
         return Err(Error::Dlopen(format!("{path}: {err}")));
     }
+    Ok(handle)
+}
+
+pub(crate) fn load_sym_ptr(handle: *mut c_void, name: &'static str) -> Result<*mut c_void> {
+    unsafe { load_sym_raw(handle, name) }.ok_or(Error::MissingSymbol(name))
+}
+
+/// dlopen `GTShaderProfiler` and dlsym every needed symbol. Returns
+/// [`Error::MissingSymbol`] if any required entry-point isn't exported
+/// (which would mean we're looking at an Xcode version with a renamed
+/// or missing function — worth flagging early).
+///
+/// Set `AGXPS_FRAMEWORK_PATH` env var to override the default Xcode
+/// location (e.g. for Xcode-beta.app or a custom toolchain).
+pub fn load() -> Result<LoadedApi> {
+    let path = framework_path();
+    let handle = open_framework()?;
 
     let api = AgxpsApi {
         gpu_create: load_sym(handle, "agxps_gpu_create")?,
@@ -453,16 +439,6 @@ pub fn load() -> Result<LoadedApi> {
             "agxps_aps_profile_data_get_esl_clique_instruction_trace",
         )?,
         get_counter_names: load_sym(handle, "agxps_aps_profile_data_get_counter_names")?,
-        get_counter_values: load_sym(handle, "agxps_aps_profile_data_get_counter_values")?,
-        get_counter_values_num: load_sym(handle, "agxps_aps_profile_data_get_counter_values_num")?,
-        get_counter_values_by_index: load_sym(
-            handle,
-            "agxps_aps_profile_data_get_counter_values_by_index",
-        )?,
-        get_counter_values_num_by_index: load_sym(
-            handle,
-            "agxps_aps_profile_data_get_counter_values_num_by_index",
-        )?,
         load_obfuscation_map: load_sym(handle, "agxps_load_counter_obfuscation_map")?,
         unload_obfuscation_map: load_sym_any(
             handle,
@@ -473,7 +449,6 @@ pub fn load() -> Result<LoadedApi> {
         )?,
         deobfuscate_name: load_sym(handle, "agxps_counter_deobfuscate_name")?,
         obfuscated_name: load_sym(handle, "agxps_counter_obfuscated_name")?,
-        counter_get_ident: load_sym(handle, "agxps_counter_get_ident")?,
         kick_time_stats_create: load_sym(handle, "agxps_aps_kick_time_stats_create")?,
         kick_time_stats_create_sampled: load_sym(
             handle,
@@ -774,38 +749,6 @@ impl LoadedApi {
             Vec::new()
         };
 
-        // For each counter, get its values vector.
-        let mut counter_values: Vec<Vec<u64>> = Vec::with_capacity(counter_num as usize);
-        for idx in 0..counter_num {
-            let mut n = 0u64;
-            let mut start_ptr: *const u64 = std::ptr::null();
-            let ok_n = unsafe { (api.get_counter_values_num_by_index)(pd, &mut n, idx) };
-            let ok_v = unsafe { (api.get_counter_values_by_index)(pd, &mut start_ptr, idx) };
-            let mut values_ok = ok_n != 0 && ok_v != 0;
-            if (!values_ok || start_ptr.is_null() || n == 0)
-                && let Some(name_ptr) = name_ptrs.get(idx as usize).copied()
-                && !name_ptr.is_null()
-            {
-                let ident = unsafe { (api.counter_get_ident)(name_ptr) };
-                let ok_n_by_ident = unsafe { (api.get_counter_values_num)(pd, &mut n, ident, 1) };
-                let ok_v_by_ident =
-                    unsafe { (api.get_counter_values)(pd, &mut start_ptr, ident, 1) };
-                if ok_n_by_ident == 0 || ok_v_by_ident == 0 {
-                    n = 0;
-                    start_ptr = std::ptr::null();
-                    values_ok = false;
-                } else {
-                    values_ok = true;
-                }
-            }
-            if values_ok && !start_ptr.is_null() && n > 0 {
-                let slice = unsafe { std::slice::from_raw_parts(start_ptr, n as usize) };
-                counter_values.push(slice.to_vec());
-            } else {
-                counter_values.push(Vec::new());
-            }
-        }
-
         // See the noxcode crate for why we leak instead of calling destroy.
         let _ = (parser, pd, gpu);
 
@@ -820,7 +763,6 @@ impl LoadedApi {
             synchronized_timestamps: sync_timestamps,
             counter_num,
             counter_names,
-            counter_values,
         })
     }
 }
@@ -856,11 +798,6 @@ pub struct DecodedProfile {
     pub counter_num: u32,
     /// Counter names (length = `counter_num`).
     pub counter_names: Vec<String>,
-    /// Per-counter values vector (outer length = `counter_num`). Inner
-    /// vec length is whatever `get_counter_values_num_by_index` returns
-    /// for that counter — likely per-kick, per-sample, or per-segment;
-    /// probe via the example to find out.
-    pub counter_values: Vec<Vec<u64>>,
 }
 
 /// Decompose a packed timestamp/index value: `kick_start`, `kick_end`,

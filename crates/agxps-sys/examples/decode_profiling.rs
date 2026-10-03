@@ -136,16 +136,9 @@ fn main() {
     }
 
     println!("\ncounters: ({} total)", decoded.counter_num);
-    let total_values: usize = decoded.counter_values.iter().map(|v| v.len()).sum();
     println!(
-        "  total counter values across all 12 indices: {total_values} \
-         (USC profile data only ships counter metadata, not values — \
-         hardware counter samples are exported through streamData \
-         `APSCounterData`/`GPRWCNTR` payloads, not this profile-data path)",
-    );
-    println!(
-        "  (counter names below are still obfuscated SHA-256 hashes; the \
-         default agxps RawCountersMapping resource is not present on macOS)",
+        "  (Profiling_f_* streams carry counter names only; counter samples live in the \
+         limiter pass's Counters_f_* streams, see agxps_sys::counters)",
     );
     for (idx, name) in decoded.counter_names.iter().enumerate() {
         let short: String = name.chars().take(16).collect();

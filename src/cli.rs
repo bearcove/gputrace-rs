@@ -83,6 +83,9 @@ enum CommandSet {
     RawCounterProbe(RawCounterProbeArgs),
     #[command(hide = true)]
     ProfilingAddressProbe(ProfilingAddressProbeArgs),
+    /// Per-encoder hardware counters from the limiter pass (agxps).
+    #[command(hide = true)]
+    HwCounters(TracePath),
     #[command(alias = "perfcounters-validate", hide = true)]
     ValidateCounters(ValidateCountersArgs),
     #[command(hide = true)]
@@ -1556,6 +1559,11 @@ pub fn run() -> Result<()> {
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-counters format")),
             }
+        }
+        CommandSet::HwCounters(args) => {
+            let trace = TraceBundle::open(&args.trace)?;
+            let report = crate::hw_counters::report(&trace)?;
+            print!("{}", crate::hw_counters::format_report(&report));
         }
         CommandSet::SynthBench(args) if args.counter_oracle => {
             let kernels = synth_bench::run_counter_oracle(&args.output)?;
