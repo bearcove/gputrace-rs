@@ -153,6 +153,18 @@ pub struct ApsCounterProfile {
     /// order; a work clique's `esl_index` indexes this list.
     pub commands: Vec<ApsCommand>,
     pub work_cliques: Vec<ApsWorkClique>,
+    /// Shader launches (ESL program runs) on this USC; a work clique's
+    /// `esl_index` names one of these by `esl_index`.
+    pub esl_cliques: Vec<ApsEslClique>,
+}
+
+/// One run of a dispatch's shader-launch program on a USC.
+#[derive(Debug, Clone, Copy)]
+pub struct ApsEslClique {
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+    pub kick_index: u32,
+    pub esl_index: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +278,11 @@ pub struct CounterApi {
     pd_clique_kick_id: FnPdRange32,
     pd_clique_missing_end: FnPdRange8,
     pd_clique_slot: FnPdRange8,
+    pd_esl_cliques_num: FnPdCount64,
+    pd_esl_clique_start: FnPdRange,
+    pd_esl_clique_end: FnPdRange,
+    pd_esl_clique_esl_id: FnPdRange,
+    pd_esl_clique_kick_id: FnPdRange32,
     analyzer_create: FnAnalyzerCreate,
     analyzer_destroy: FnAnalyzerVoid,
     analyzer_process_usc: FnAnalyzerProcess,
@@ -355,6 +372,11 @@ impl CounterApi {
             pd_clique_kick_id: s!("agxps_aps_profile_data_get_work_clique_kick_id"),
             pd_clique_missing_end: s!("agxps_aps_profile_data_get_work_clique_missing_end"),
             pd_clique_slot: s!("agxps_aps_profile_data_get_work_clique_clique_id"),
+            pd_esl_cliques_num: s!("agxps_aps_profile_data_get_esl_cliques_num"),
+            pd_esl_clique_start: s!("agxps_aps_profile_data_get_esl_clique_start"),
+            pd_esl_clique_end: s!("agxps_aps_profile_data_get_esl_clique_end"),
+            pd_esl_clique_esl_id: s!("agxps_aps_profile_data_get_esl_clique_esl_id"),
+            pd_esl_clique_kick_id: s!("agxps_aps_profile_data_get_esl_clique_kick_id"),
             analyzer_create: s!("agxps_aps_timing_analyzer_create"),
             analyzer_destroy: s!("agxps_aps_timing_analyzer_destroy"),
             analyzer_process_usc: s!("agxps_aps_timing_analyzer_process_usc"),
@@ -800,6 +822,29 @@ impl CounterGpu<'_> {
             })
             .collect();
 
+        let esl_count = unsafe { (api.pd_esl_cliques_num)(pd) } as usize;
+        let mut esl_starts = vec![0u64; esl_count];
+        let mut esl_ends = vec![0u64; esl_count];
+        let mut esl_ids = vec![0u64; esl_count];
+        let mut esl_kicks = vec![0u32; esl_count];
+        if esl_count > 0 {
+            let n = esl_count as u64;
+            unsafe {
+                (api.pd_esl_clique_start)(pd, esl_starts.as_mut_ptr(), 0, n);
+                (api.pd_esl_clique_end)(pd, esl_ends.as_mut_ptr(), 0, n);
+                (api.pd_esl_clique_esl_id)(pd, esl_ids.as_mut_ptr(), 0, n);
+                (api.pd_esl_clique_kick_id)(pd, esl_kicks.as_mut_ptr(), 0, n);
+            }
+        }
+        let esl_cliques = (0..esl_count)
+            .map(|index| ApsEslClique {
+                start_ticks: unsafe { (api.pd_system_timestamp)(pd, esl_starts[index]) },
+                end_ticks: unsafe { (api.pd_system_timestamp)(pd, esl_ends[index]) },
+                kick_index: esl_kicks[index],
+                esl_index: esl_ids[index],
+            })
+            .collect();
+
         ApsCounterProfile {
             counter_names,
             values,
@@ -808,6 +853,7 @@ impl CounterGpu<'_> {
             kicks,
             commands: unsafe { self.timing_commands(pd) },
             work_cliques,
+            esl_cliques,
         }
     }
 

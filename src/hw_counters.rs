@@ -1464,10 +1464,24 @@ fn match_commands(
                 .map(|command| (command.start_ticks, format!("{:#x}", command.esl_shader_address)))
                 .collect::<Vec<_>>();
             commands.sort_unstable();
+            let kick_indices = kicks
+                .iter()
+                .enumerate()
+                .filter(|(_, kick)| kick.software_id == *software_id)
+                .map(|(index, _)| index as u32)
+                .collect::<Vec<_>>();
+            let mut launches = profile
+                .esl_cliques
+                .iter()
+                .filter(|esl| kick_indices.contains(&esl.kick_index))
+                .map(|esl| (esl.start_ticks, esl.esl_index))
+                .collect::<Vec<_>>();
+            launches.sort_unstable();
             tracing::trace!(
                 kick = format!("{software_id:#x}"),
                 ?groups,
                 ?commands,
+                ?launches,
                 "hw counters: esl groups (first start, esl index, cliques) vs analyzer commands"
             );
         }
