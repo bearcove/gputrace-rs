@@ -5942,7 +5942,6 @@ fn marker_for_offset(data: &[u8], markers: &[usize], offset: usize) -> Option<(u
 mod tests {
     use super::*;
     use plist::Integer;
-    use tempfile::tempdir;
 
     fn test_integer(value: u64) -> Value {
         Value::Integer(Integer::from(value))

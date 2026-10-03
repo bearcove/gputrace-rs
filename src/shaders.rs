@@ -1752,15 +1752,15 @@ fn attribute_line_costs(lines: &mut [AttributedSourceLine], context: LineCostCon
         }
     }
 
-    if let Some(alu_utilization) = context.alu_utilization_percent {
-        if alu_utilization > 50.0 {
-            compute_weight += (alu_utilization - 50.0) / 100.0;
-        }
+    if let Some(alu_utilization) = context.alu_utilization_percent
+        && alu_utilization > 50.0
+    {
+        compute_weight += (alu_utilization - 50.0) / 100.0;
     }
-    if let Some(llc) = context.last_level_cache_percent {
-        if llc > 5.0 {
-            memory_weight += (llc / 100.0).min(0.75);
-        }
+    if let Some(llc) = context.last_level_cache_percent
+        && llc > 5.0
+    {
+        memory_weight += (llc / 100.0).min(0.75);
     }
     if let Some(bandwidth) = context.device_memory_bandwidth_gbps {
         if bandwidth > 10.0 {

@@ -281,10 +281,12 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
     writer.write_index(
         trace_path,
         &trace,
-        &analysis,
-        xcode_mio_summary.as_ref(),
-        raw_counters.as_ref(),
-        hw_counter_report.as_deref().ok(),
+        IndexSources {
+            analysis: &analysis,
+            xcode_mio: xcode_mio_summary.as_ref(),
+            raw_counters: raw_counters.as_ref(),
+            hw_counters: hw_counter_report.as_deref().ok(),
+        },
         total_ms,
     )?;
 
@@ -295,6 +297,14 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         section_timings: writer.section_timings,
         total_ms,
     })
+}
+
+/// Reports whose headline numbers go into index.md.
+struct IndexSources<'a> {
+    analysis: &'a analysis::AnalysisReport,
+    xcode_mio: Option<&'a xcode_mio::XcodeMioAnalysisReport>,
+    raw_counters: Option<&'a counter::RawCountersReport>,
+    hw_counters: Option<&'a hw_counters::HwCounterReport>,
 }
 
 impl ReportWriter {
@@ -422,12 +432,15 @@ impl ReportWriter {
         &mut self,
         trace_path: &Path,
         trace: &TraceBundle,
-        analysis: &analysis::AnalysisReport,
-        xcode_mio: Option<&xcode_mio::XcodeMioAnalysisReport>,
-        raw_counters: Option<&counter::RawCountersReport>,
-        hw_counters: Option<&hw_counters::HwCounterReport>,
+        sources: IndexSources<'_>,
         total_ms: f64,
     ) -> Result<()> {
+        let IndexSources {
+            analysis,
+            xcode_mio,
+            raw_counters,
+            hw_counters,
+        } = sources;
         let mut out = String::new();
         out.push_str("# gputrace Report\n\n");
         out.push_str(&format!("- Trace: `{}`\n", trace_path.display()));
