@@ -554,6 +554,27 @@ pub fn report_for_profiler_dir(
         .iter()
         .find(|entry| entry.get("Configuration Variables").is_some())
         .ok_or_else(|| Error::InvalidInput("profile has no APS metadata".to_owned()))?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for (index, entry) in entries.iter().enumerate() {
+            let mappings = entry
+                .get("Program Address Mappings")
+                .and_then(ArchiveValue::as_array)
+                .map(|mappings| mappings.len());
+            let trace_ids = entry
+                .get("TraceId to BatchId")
+                .and_then(ArchiveValue::nested)
+                .and_then(|map| Some(map.as_dictionary()?.len()));
+            tracing::debug!(
+                index,
+                source = entry.get("Source").and_then(ArchiveValue::as_str),
+                limiter = entry.get("Limiter Counter List Map").is_some(),
+                config = entry.get("Configuration Variables").is_some(),
+                ?mappings,
+                ?trace_ids,
+                "hw counters: APSCounterData entry"
+            );
+        }
+    }
     let config = metadata.get("Configuration Variables").unwrap();
     let config_u64 = |key: &str| config.get(key).and_then(ArchiveValue::as_u64);
     let mut warnings = Vec::new();
