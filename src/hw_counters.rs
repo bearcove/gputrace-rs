@@ -1249,7 +1249,8 @@ fn attribute(
             if kick_residency == 0 {
                 // No traced clique of this kick in the sample (clique ends are
                 // estimates): charge the dispatches whose activity span on
-                // this stream covers it, by overlap. Time stays uncredited.
+                // this stream covers it, by overlap, else the latest one to
+                // have started. Time stays uncredited.
                 let spans = hulls
                     .get(kick)
                     .map(|spans| {
@@ -1262,6 +1263,19 @@ fn attribute(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let mut spans = spans;
+                if spans.is_empty() {
+                    // Past every span: the dispatch that finished last was
+                    // still draining (its clique ends were capped short).
+                    if let Some((dispatch, _, _)) = hulls.get(kick).and_then(|spans| {
+                        spans
+                            .iter()
+                            .filter(|(_, a, _)| *a < end)
+                            .max_by_key(|(_, _, b)| *b)
+                    }) {
+                        spans.push((*dispatch, 1));
+                    }
+                }
                 let total = spans.iter().map(|(_, ticks)| *ticks).sum::<u64>();
                 for (dispatch, ticks) in spans {
                     out.dispatches.entry(dispatch).or_default().add_counts(
