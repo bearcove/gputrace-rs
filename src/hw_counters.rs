@@ -666,6 +666,15 @@ pub fn report_for_profiler_dir(
         ) else {
             continue;
         };
+        tracing::trace!(
+            kind,
+            encoder_trace = format!("{encoder_trace:#x}"),
+            address = format!("{address:#x}"),
+            dispatch,
+            fields = ?mapping.as_dictionary().map(|fields| fields.keys().cloned().collect::<Vec<_>>()),
+            binary = ?mapping.get("binaryUniqueId"),
+            "hw counters: program address mapping"
+        );
         let dispatch = dispatch as usize;
         let Some(encoder) = encoder_of_trace.get(&encoder_trace).copied() else {
             continue;
