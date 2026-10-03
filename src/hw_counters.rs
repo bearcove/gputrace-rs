@@ -311,6 +311,11 @@ pub struct HwCounterRow {
     /// this capture was also running. Counters are GPU-wide or per core, not
     /// per process, so a large value makes the row unreliable.
     pub foreign_overlap: f64,
+    /// Shader-core samples credited to the row (residency shares summed over
+    /// cores). Unlike `gpu_time_ns` this does not double-count concurrent
+    /// rows, so a row's share of the table's total is its share of
+    /// shader-core time.
+    pub core_samples: f64,
     /// Fraction of the row's counts taken from samples it shared with other
     /// rows of the same kind (split by clique time). 0 means every sample was
     /// exclusively this row's.
@@ -1095,6 +1100,10 @@ pub fn report_for_profiler_dir(
                 .count(),
             gpu_time_ns: span_ns(&spans),
             foreign_overlap: foreign_fraction(&spans),
+            core_samples: usc_accums
+                .encoders
+                .get(encoder_index)
+                .map_or(0.0, |accum| accum.weight),
             shared: shared_of(usc_accums.encoders.get(encoder_index)),
             values,
         });
@@ -1120,6 +1129,10 @@ pub fn report_for_profiler_dir(
             capture_dispatches: 1,
             gpu_time_ns: span_ns(&spans),
             foreign_overlap: foreign_fraction(&spans),
+            core_samples: usc_accums
+                .dispatches
+                .get(&dispatch)
+                .map_or(0.0, |accum| accum.weight),
             shared: shared_of(usc_accums.dispatches.get(&dispatch)),
             values,
         });
@@ -1147,6 +1160,7 @@ pub fn report_for_profiler_dir(
                 capture_dispatches: kernel_capture_dispatches.get(&kernel).copied().unwrap_or(0),
                 gpu_time_ns: span_ns(&spans),
                 foreign_overlap: foreign_fraction(&spans),
+                core_samples: usc_kernels.get(&kernel).map_or(0.0, |accum| accum.weight),
                 shared: shared_of(usc_kernels.get(&kernel)),
                 label: kernel,
                 values,
@@ -1784,7 +1798,11 @@ pub fn format_markdown(report: &HwCounterReport) -> String {
          formulas for this exact GPU. Per-encoder rows are exact (samples are attributed by \
          the encoder's own GPU kicks). Per-dispatch and per-kernel rows split samples between \
          dispatches by their measured residency on each shader core; `shrd%` says how much of \
-         a row came from such shared samples. `frgn%` is the fraction of a row's time during \
+         a row came from such shared samples. `gpu_us` is the time a row had work resident \
+         (concurrent rows overlap); `core%` is its share of shader-core samples, which adds up \
+         to 100 % over a table. `disp` is `reported/total` when the timing analyzer did not \
+         report every dispatch: the unreported ones are counted with the dispatch that \
+         started before them on the same core. `frgn%` is the fraction of a row's time during \
          which GPU work not from this capture (another process, or the replayer's own) also \
          ran: those counts are mixed in. \
          How it works and what was validated: `docs/COUNTERS_M4.md` in gputrace-rs.\n\n",
@@ -1843,9 +1861,10 @@ pub fn format_rows(rows: &[HwCounterRow]) -> String {
         .max()
         .unwrap_or(5)
         .clamp(5, 48);
+    let total_samples = rows.iter().map(|row| row.core_samples).sum::<f64>();
     let mut out = format!(
-        "{:<label_width$} {:>9} {:>9} {:>6} {:>6}",
-        "row", "disp", "gpu_us", "frgn%", "shrd%"
+        "{:<label_width$} {:>9} {:>9} {:>6} {:>6} {:>6}",
+        "row", "disp", "gpu_us", "core%", "frgn%", "shrd%"
     );
     for spec in METRICS {
         out.push_str(&format!(" {:>13}", spec.label));
@@ -1860,10 +1879,15 @@ pub fn format_rows(rows: &[HwCounterRow]) -> String {
             row.dispatches.to_string()
         };
         out.push_str(&format!(
-            "{:<label_width$} {:>9} {:>9.1} {:>6.1} {:>6.1}",
+            "{:<label_width$} {:>9} {:>9.1} {:>6.1} {:>6.1} {:>6.1}",
             label,
             dispatches,
             row.gpu_time_ns / 1000.0,
+            if total_samples > 0.0 {
+                row.core_samples / total_samples * 100.0
+            } else {
+                0.0
+            },
             row.foreign_overlap * 100.0,
             row.shared * 100.0
         ));
