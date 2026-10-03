@@ -100,11 +100,7 @@ pub fn format_summary(report: &XcodeCostScanReport, top: Option<usize>) -> Strin
     }
 
     let limit = top.unwrap_or(80);
-    let mut printed = 0usize;
-    for (target, hits) in by_target {
-        if printed >= limit {
-            break;
-        }
+    for (target, hits) in by_target.into_iter().take(limit) {
         let first = hits[0];
         out.push_str(&format!(
             "{:<28} hits={:<5} first={}@0x{:x} {} value={:.9} delta={:.3e}\n",
@@ -116,7 +112,6 @@ pub fn format_summary(report: &XcodeCostScanReport, top: Option<usize>) -> Strin
             first.matched_value,
             first.delta,
         ));
-        printed += 1;
     }
 
     if report.matches.is_empty() {

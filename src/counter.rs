@@ -4801,9 +4801,7 @@ fn probe_stream_archives_from_groups(groups: &StreamArchiveGroups) -> Vec<RawCou
 }
 
 fn load_stream_archive_groups(trace_path: &Path) -> Option<StreamArchiveGroups> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return None;
-    };
+    let profiler_dir = profiler::find_profiler_directory(trace_path)?;
     let stream_data_path = profiler_dir.join("streamData");
     let Ok(plist) = Value::from_file(stream_data_path) else {
         return None;
