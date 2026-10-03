@@ -1140,7 +1140,9 @@ pub fn report_for_profiler_dir(
     let usc_kernels = kernel_accums(&usc_accums);
     let mut kernel_capture_dispatches = BTreeMap::<String, usize>::new();
     for dispatch in dispatch_info.keys() {
-        *kernel_capture_dispatches.entry(kernel_key(*dispatch)).or_default() += 1;
+        *kernel_capture_dispatches
+            .entry(kernel_key(*dispatch))
+            .or_default() += 1;
     }
     if dispatches.len() < dispatch_info.len() {
         warnings.push(format!(
@@ -1319,7 +1321,8 @@ fn usc_activity(
                 return Some((kick, *command));
             }
             let starts = starts_by_kick.get(&kicks.get(kick)?.software_id)?;
-            let position = starts.partition_point(|(start, _)| *start <= clique.start_ticks + guard);
+            let position =
+                starts.partition_point(|(start, _)| *start <= clique.start_ticks + guard);
             let (_, command) = starts.get(position.checked_sub(1)?)?;
             Some((kick, *command))
         })
@@ -1461,7 +1464,12 @@ fn match_commands(
                 .commands
                 .iter()
                 .filter(|command| command.software_id == *software_id)
-                .map(|command| (command.start_ticks, format!("{:#x}", command.esl_shader_address)))
+                .map(|command| {
+                    (
+                        command.start_ticks,
+                        format!("{:#x}", command.esl_shader_address),
+                    )
+                })
                 .collect::<Vec<_>>();
             commands.sort_unstable();
             let kick_indices = kicks
