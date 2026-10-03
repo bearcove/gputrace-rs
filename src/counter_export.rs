@@ -236,8 +236,8 @@ pub fn report_with_context(
         let kernel_invocations = row_metric("Kernel Invocations")
             .map(|value| value.round().max(0.0) as usize)
             .unwrap_or(encoder.dispatch_count);
-        let occupancy_percent =
-            row_metric("Kernel Occupancy").or_else(|| limiter.and_then(|limiter| limiter.occupancy));
+        let occupancy_percent = row_metric("Kernel Occupancy")
+            .or_else(|| limiter.and_then(|limiter| limiter.occupancy));
         let alu_utilization_percent = row_metric("ALU Utilization")
             .or_else(|| limiter.and_then(|limiter| limiter.alu_utilization));
         let device_memory_bandwidth_gbps = row_metric("Device Memory Bandwidth")

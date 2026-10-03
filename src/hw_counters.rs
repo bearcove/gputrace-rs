@@ -329,7 +329,10 @@ impl HwCounterRow {
 
     /// DRAM (Apple fabric) read + write bandwidth in GB/s.
     pub fn dram_gbps(&self) -> Option<f64> {
-        match (self.gbps("AF Read Bandwidth"), self.gbps("AF Write Bandwidth")) {
+        match (
+            self.gbps("AF Read Bandwidth"),
+            self.gbps("AF Write Bandwidth"),
+        ) {
             (None, None) => None,
             (read, write) => Some(read.unwrap_or(0.0) + write.unwrap_or(0.0)),
         }
@@ -512,7 +515,9 @@ pub fn report_for_profiler_dir(
     _profiler_dir: &Path,
     _dispatch_names: &BTreeMap<usize, String>,
 ) -> Result<HwCounterReport> {
-    Err(Error::Unsupported("hardware counters require macOS and Xcode"))
+    Err(Error::Unsupported(
+        "hardware counters require macOS and Xcode",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -684,7 +689,9 @@ pub fn report_for_profiler_dir(
     for entry in &entries {
         let (Some(source), Some(blob)) = (
             entry.get("Source").and_then(ArchiveValue::as_str),
-            entry.get("ShaderProfilerData").and_then(ArchiveValue::as_data),
+            entry
+                .get("ShaderProfilerData")
+                .and_then(ArchiveValue::as_data),
         ) else {
             continue;
         };
@@ -785,7 +792,12 @@ pub fn report_for_profiler_dir(
         .collect::<Vec<_>>();
     offsets.sort_unstable();
     let continuous_minus_absolute = offsets.get(offsets.len() / 2).copied().unwrap_or_else(|| {
-        let field = |key: &str| metadata.get(key).and_then(ArchiveValue::as_i64).unwrap_or(0);
+        let field = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(ArchiveValue::as_i64)
+                .unwrap_or(0)
+        };
         field("Continuous Time") as i128 - field("Absolute Time") as i128
     });
     let to_absolute = |ticks: u64| (ticks as i128 - continuous_minus_absolute).max(0) as u64;
@@ -883,7 +895,13 @@ pub fn report_for_profiler_dir(
     let mut global_families = BTreeMap::<String, Accums>::new();
     for ((source, ring), stream) in &global_streams {
         let mut accums = Accums::default();
-        attribute(stream, &global_kicks, &global_activity, timebase_ns, &mut accums);
+        attribute(
+            stream,
+            &global_kicks,
+            &global_activity,
+            timebase_ns,
+            &mut accums,
+        );
         // BTreeMap order visits each source's lowest ring first.
         let take_time = !global_families.contains_key(source);
         tracing::trace!(source, ring, take_time, "hw counters: global stream");
@@ -896,7 +914,10 @@ pub fn report_for_profiler_dir(
     // --- Kernels: dispatch accumulations summed by kernel. ---
     let kernel_key = |dispatch: usize| -> String {
         dispatch_names.get(&dispatch).cloned().unwrap_or_else(|| {
-            match dispatch_info.get(&dispatch).and_then(|info| info.kernel_address) {
+            match dispatch_info
+                .get(&dispatch)
+                .and_then(|info| info.kernel_address)
+            {
                 Some(address) => format!("kernel@{address:#x}"),
                 None => format!("dispatch {dispatch}"),
             }
@@ -920,8 +941,20 @@ pub fn report_for_profiler_dir(
     let mut kernel_values = BTreeMap::<String, BTreeMap<String, f64>>::new();
     for family in &families {
         let kernels = kernel_accums(family);
-        derive_into(&gpu, &derived, &constants, &family.encoders, &mut encoder_values)?;
-        derive_into(&gpu, &derived, &constants, &family.dispatches, &mut dispatch_values)?;
+        derive_into(
+            &gpu,
+            &derived,
+            &constants,
+            &family.encoders,
+            &mut encoder_values,
+        )?;
+        derive_into(
+            &gpu,
+            &derived,
+            &constants,
+            &family.dispatches,
+            &mut dispatch_values,
+        )?;
         derive_into(&gpu, &derived, &constants, &kernels, &mut kernel_values)?;
     }
 
@@ -1248,11 +1281,13 @@ fn usc_activity(
                 None => {
                     let own = owner.map(|(_, command)| command);
                     if let Some((next, _)) =
-                        starts_by_kick.get(&kick_info.software_id).and_then(|starts| {
-                            starts.iter().find(|(start, command)| {
-                                *start > clique.start_ticks && Some(*command) != own
+                        starts_by_kick
+                            .get(&kick_info.software_id)
+                            .and_then(|starts| {
+                                starts.iter().find(|(start, command)| {
+                                    *start > clique.start_ticks && Some(*command) != own
+                                })
                             })
-                        })
                     {
                         end = end.min(*next);
                     }
@@ -1305,7 +1340,10 @@ fn match_commands(
     }
     let mut by_kick = BTreeMap::<u64, Vec<(u64, u64)>>::new();
     for (esl, (software_id, first)) in &groups {
-        by_kick.entry(*software_id).or_default().push((*first, *esl));
+        by_kick
+            .entry(*software_id)
+            .or_default()
+            .push((*first, *esl));
     }
     let mut out = BTreeMap::new();
     let mut order = (0..profile.commands.len()).collect::<Vec<_>>();
@@ -1553,7 +1591,10 @@ pub fn agxps_gpu_for_profile(profiler_dir: &Path) -> Option<(u32, u32)> {
         .find_map(|entry| entry.get("Configuration Variables").cloned())?;
     let generation = config.get("gpu_gen")?.as_u64()? as u32;
     let num_cores = config.get("num_cores")?.as_u64()?;
-    let num_mgpus = config.get("num_mgpus").and_then(ArchiveValue::as_u64).unwrap_or(1);
+    let num_mgpus = config
+        .get("num_mgpus")
+        .and_then(ArchiveValue::as_u64)
+        .unwrap_or(1);
     let api = agxps_sys::counters::counter_api().ok()?;
     api.variants(generation)
         .into_iter()
@@ -1659,12 +1700,7 @@ pub fn format_report(report: &HwCounterReport) -> String {
     let gpu = &report.gpu;
     out.push_str(&format!(
         "GPU: {} (agxps generation {} variant {}), {} cores, {} mGPUs, peak DRAM {:.1} GB/s\n",
-        gpu.gpu_type,
-        gpu.generation,
-        gpu.variant,
-        gpu.num_cores,
-        gpu.num_mgpus,
-        gpu.peak_dram_gbps
+        gpu.gpu_type, gpu.generation, gpu.variant, gpu.num_cores, gpu.num_mgpus, gpu.peak_dram_gbps
     ));
     out.push_str(&format!(
         "Source: limiter pass; {} per-core streams sampled every {} core cycles, GPU-global streams every {:.1} us\n",

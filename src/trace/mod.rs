@@ -261,10 +261,16 @@ impl TraceBundle {
         }
         // Specialized functions have no CS name record; their CUt record
         // points at a descriptor blob that names them.
-        if blob_refs.keys().any(|address| !label_map.contains_key(address)) {
+        if blob_refs
+            .keys()
+            .any(|address| !label_map.contains_key(address))
+        {
             let blobs = self.store_blobs()?;
             for (address, key) in blob_refs {
-                if let Some(name) = blobs.get(&key).and_then(|blob| function_descriptor_name(blob)) {
+                if let Some(name) = blobs
+                    .get(&key)
+                    .and_then(|blob| function_descriptor_name(blob))
+                {
                     label_map.entry(address).or_insert(name);
                 }
             }

@@ -180,8 +180,7 @@ impl MTSPRecord {
             }
             let size = u32::from_le_bytes(data[i - 4..i].try_into().unwrap()) as usize;
             let start = i - 4;
-            if size < 0x28
-                || size > 0x10000
+            if !(0x28..=0x10000).contains(&size)
                 || start + size > data.len()
                 || !data[i + 4..i + 4 + 24].iter().all(|&byte| byte == 0)
             {
@@ -581,15 +580,16 @@ impl MTSPRecord {
     /// and the like), the object it returned: the address after the `t`
     /// marker that follows the arguments. `setLabel:`-style records have none.
     pub fn returned_address(&self) -> Option<u64> {
-        let label_end = self
-            .label
-            .as_ref()
-            .and_then(|label| find_bytes(&self.data, label.as_bytes()).map(|start| start + label.len()))?;
+        let label_end = self.label.as_ref().and_then(|label| {
+            find_bytes(&self.data, label.as_bytes()).map(|start| start + label.len())
+        })?;
         let marker = find_bytes(&self.data[label_end..], b"t\0\0\0")? + label_end;
         if self.data[label_end..marker].iter().any(|&byte| byte != 0) {
             return None;
         }
-        read_u64(&self.data, marker + 4).ok().filter(|&address| address != 0)
+        read_u64(&self.data, marker + 4)
+            .ok()
+            .filter(|&address| address != 0)
     }
 
     fn parse_cut_blob_record(&mut self) {

@@ -174,7 +174,7 @@ fn report_without_agxps(
     profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
 ) -> Result<TimingReport> {
     if let Some(summary) = profiler_summary {
-        return Ok(report_from_profiler(trace, &summary));
+        return Ok(report_from_profiler(trace, summary));
     }
     if let Ok(raw_timings) = profiler::raw_encoder_timings(&trace.path)
         && !raw_timings.is_empty()

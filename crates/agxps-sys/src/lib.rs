@@ -176,7 +176,6 @@ pub type FnDeobfuscateName = unsafe extern "C" fn(obfuscated: *const c_char) -> 
 /// unchanged if no mapping exists / map not loaded.
 pub type FnObfuscatedName = unsafe extern "C" fn(readable: *const c_char) -> *const c_char;
 
-
 /// `agxps_aps_kick_time_stats_create(pd, timestamp_kind, start_kind, end_kind, filter_block)`.
 ///
 /// `timestamp_kind`: 0 = system timestamp, 1 = USC timestamp. `start_kind` /
@@ -318,8 +317,7 @@ unsafe impl Sync for AgxpsApi {}
 /// which honors `DEVELOPER_DIR` and points at Xcode-beta when selected), falling
 /// back to the stock `/Applications/Xcode.app`. Overridden by `AGXPS_FRAMEWORK_PATH`.
 fn default_framework_path() -> String {
-    const REL: &str =
-        "PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
+    const REL: &str = "PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
     std::process::Command::new("xcode-select")
         .arg("-p")
         .output()

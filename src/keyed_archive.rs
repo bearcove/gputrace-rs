@@ -120,7 +120,11 @@ fn plain(value: &Value) -> ArchiveValue {
         Value::Integer(value) => value
             .as_signed()
             .map(|value| ArchiveValue::Integer(value.into()))
-            .or_else(|| value.as_unsigned().map(|value| ArchiveValue::Integer(value.into())))
+            .or_else(|| {
+                value
+                    .as_unsigned()
+                    .map(|value| ArchiveValue::Integer(value.into()))
+            })
             .unwrap_or(ArchiveValue::Null),
         Value::Real(value) => ArchiveValue::Real(*value),
         Value::String(value) => ArchiveValue::String(value.clone()),

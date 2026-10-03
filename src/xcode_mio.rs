@@ -6264,12 +6264,12 @@ mod platform {
             .unwrap_or(default)
     }
 
-    fn agxps_trace_group<'a>(
-        groups: &'a mut BTreeMap<(usize, u64), XcodeMioPipelineAgxpsTraceCost>,
+    fn agxps_trace_group(
+        groups: &mut BTreeMap<(usize, u64), XcodeMioPipelineAgxpsTraceCost>,
         pipeline_index: usize,
         esl_shader_address: u64,
         work_shader_address: u64,
-    ) -> &'a mut XcodeMioPipelineAgxpsTraceCost {
+    ) -> &mut XcodeMioPipelineAgxpsTraceCost {
         groups
             .entry((pipeline_index, esl_shader_address))
             .or_insert_with(|| XcodeMioPipelineAgxpsTraceCost {
@@ -8364,8 +8364,8 @@ mod platform {
         if let Some(value) = unsafe { objc_number_value(value) } {
             return vec![vec![value]];
         }
-        if unsafe { responds_to_selector(value, "allValues") } {
-            if let Ok(values) = unsafe { send_id_allow_nil(value, "allValues") }
+        if unsafe { responds_to_selector(value, "allValues") }
+            && let Ok(values) = unsafe { send_id_allow_nil(value, "allValues") }
                 && !values.is_null()
             {
                 let rows = unsafe { decode_numeric_rows_at(values, depth + 1) };
@@ -8373,7 +8373,6 @@ mod platform {
                     return rows;
                 }
             }
-        }
         if !unsafe { responds_to_selector(value, "count") }
             || !unsafe { responds_to_selector(value, "objectAtIndex:") }
         {

@@ -560,8 +560,9 @@ pub fn missing_profile_families(path: &Path) -> Option<Vec<&'static str>> {
 /// once per process (every report section asks for the stream summary).
 fn trace_function_names(path: &Path) -> Option<std::sync::Arc<crate::trace::PipelineFunctionMap>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Option<Arc<crate::trace::PipelineFunctionMap>>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<BTreeMap<PathBuf, Option<Arc<crate::trace::PipelineFunctionMap>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut cache = cache.lock().ok()?;
     cache

@@ -52,8 +52,13 @@ type FnIdentStr = unsafe extern "C" fn(CounterIdent) -> *const c_char;
 type FnIdentBool = unsafe extern "C" fn(CounterIdent) -> bool;
 type FnIdentU64 = unsafe extern "C" fn(CounterIdent) -> u64;
 type FnIdentGroup = unsafe extern "C" fn(CounterIdent, u64) -> *const c_char;
-type FnRawUsed =
-    unsafe extern "C" fn(AgxpsGpu, *const CounterIdent, u64, *mut *mut CounterIdent, *mut u64) -> bool;
+type FnRawUsed = unsafe extern "C" fn(
+    AgxpsGpu,
+    *const CounterIdent,
+    u64,
+    *mut *mut CounterIdent,
+    *mut u64,
+) -> bool;
 type FnTsCreateNoCopy =
     unsafe extern "C" fn(u32, *const c_void, u64, unsafe extern "C" fn(*mut c_void)) -> *mut c_void;
 type FnTsDestroy = unsafe extern "C" fn(*mut c_void);
@@ -434,7 +439,9 @@ fn c_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -521,7 +528,9 @@ impl CounterGpu<'_> {
         let api = self.api;
         let len = gpu_cycles.len();
         if delta_seconds.len() != len || raw.iter().any(|(_, series)| series.len() != len) {
-            return Err(Error::CounterCompute("input series lengths differ".to_owned()));
+            return Err(Error::CounterCompute(
+                "input series lengths differ".to_owned(),
+            ));
         }
         let cycles_ident = self
             .ident(GPU_CYCLES)
@@ -731,7 +740,8 @@ impl CounterGpu<'_> {
                     sync_index, usc_index, &system, &usc, &sync,
                 ));
                 let usc_now = usc.get(usc_index).copied().unwrap_or(0);
-                sample_cycles.push(previous_usc.map_or(0, |prev: u64| usc_now.saturating_sub(prev)));
+                sample_cycles
+                    .push(previous_usc.map_or(0, |prev: u64| usc_now.saturating_sub(prev)));
                 previous_usc = Some(usc_now);
             }
         }

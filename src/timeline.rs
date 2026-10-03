@@ -442,7 +442,7 @@ pub fn build(
             .cmp(&right.command_buffer_index)
             .then_with(|| left.index.cmp(&right.index))
     });
-    dispatches.sort_by(|left, right| left.index.cmp(&right.index));
+    dispatches.sort_by_key(|left| left.index);
 
     let counter_tracks =
         build_counter_tracks(&encoders, &dispatches, profiler_summary, counter_limiters);
@@ -1227,7 +1227,7 @@ impl CounterTrackBuilder {
             return None;
         }
         self.samples
-            .sort_by(|left, right| left.timestamp_ns.cmp(&right.timestamp_ns));
+            .sort_by_key(|left| left.timestamp_ns);
         let mut min_value = f64::INFINITY;
         let mut max_value = f64::NEG_INFINITY;
         let mut total = 0.0;

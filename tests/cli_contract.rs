@@ -19,9 +19,18 @@ fn render_help(path: &[&str]) -> String {
 fn top_level_help_lists_only_report() {
     let help = render_help(&[]);
 
-    assert!(help.contains("report"), "top-level help should mention report\n{help}");
+    assert!(
+        help.contains("report"),
+        "top-level help should mention report\n{help}"
+    );
     // `report` is the one public workflow; internal subcommands stay hidden.
-    for internal in ["dump-records", "raw-counters", "xcode-counters", "profiler-coverage", "clear-buffers"] {
+    for internal in [
+        "dump-records",
+        "raw-counters",
+        "xcode-counters",
+        "profiler-coverage",
+        "clear-buffers",
+    ] {
         assert!(
             !help.contains(internal),
             "top-level help should not list internal {internal}\n{help}"

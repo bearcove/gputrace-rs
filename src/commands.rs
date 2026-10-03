@@ -373,7 +373,7 @@ pub fn encoders_with_profiler_summary(
     {
         summary.dispatch_count = timing.dispatch_count;
     }
-    entries.sort_by(|left, right| left.index.cmp(&right.index));
+    entries.sort_by_key(|left| left.index);
 
     let command_buffer_count = command_buffers.len();
     let average_encoders_per_command_buffer = if command_buffer_count == 0 {

@@ -2091,7 +2091,9 @@ fn gpu_counter_graph_paths() -> Vec<PathBuf> {
         paths.push(contents.join(REL));
     }
     // Stock fallback.
-    paths.push(PathBuf::from(format!("/Applications/Xcode.app/Contents/{REL}")));
+    paths.push(PathBuf::from(format!(
+        "/Applications/Xcode.app/Contents/{REL}"
+    )));
     paths
 }
 
@@ -2427,22 +2429,21 @@ fn choose_agx_derived_script(
         .into_iter()
         .filter(|(path, _)| {
             device_generation.is_none_or(|generation| {
-                agx_statistics_stem(path).and_then(|stem| agx_generation(&stem))
-                    == Some(generation)
+                agx_statistics_stem(path).and_then(|stem| agx_generation(&stem)) == Some(generation)
             })
         })
         .max_by(
-        |(left_path, left_definitions), (right_path, right_definitions)| {
-            agx_derived_script_score(left_path, left_definitions, device_identifier, variables)
-                .cmp(&agx_derived_script_score(
-                    right_path,
-                    right_definitions,
-                    device_identifier,
-                    variables,
-                ))
-                .then_with(|| right_path.cmp(left_path))
-        },
-    )
+            |(left_path, left_definitions), (right_path, right_definitions)| {
+                agx_derived_script_score(left_path, left_definitions, device_identifier, variables)
+                    .cmp(&agx_derived_script_score(
+                        right_path,
+                        right_definitions,
+                        device_identifier,
+                        variables,
+                    ))
+                    .then_with(|| right_path.cmp(left_path))
+            },
+        )
 }
 
 fn agx_derived_script_score(
@@ -2517,8 +2518,7 @@ fn trace_agx_device_identifier(trace_path: &Path) -> Option<String> {
             .chars()
             .take_while(char::is_ascii_alphanumeric)
             .collect::<String>();
-        (identifier.starts_with('G') && agx_generation(&identifier).is_some())
-            .then_some(identifier)
+        (identifier.starts_with('G') && agx_generation(&identifier).is_some()).then_some(identifier)
     })
 }
 
@@ -2606,14 +2606,14 @@ fn raw_counter_js_variables_from_parts(
         if !path.contains("/Derived Counter Sample Data/") {
             continue;
         }
-        let Some((record_size, _)) = gprw_record_info(&data) else {
+        let Some((record_size, _)) = gprw_record_info(data) else {
             continue;
         };
         let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
-        let path_ids = parse_derived_counter_sample_path(&path);
+        let path_ids = parse_derived_counter_sample_path(path);
         let Some(counter_names) = path_ids
             .sample_group
             .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
@@ -2671,20 +2671,20 @@ fn raw_counter_js_variable_groups_from_parts(
         .flat_map(|metadata| metadata.encoder_sample_indices.iter())
         .collect::<Vec<_>>();
     let encoder_sample_windows =
-        raw_counter_encoder_sample_windows(&sample_blobs, &encoder_sample_indices);
+        raw_counter_encoder_sample_windows(sample_blobs, &encoder_sample_indices);
     let mut encoder_sample_groups = BTreeMap::<usize, RawCounterJsGroupAccum>::new();
     for (path, data) in sample_blobs {
         if !path.contains("/Derived Counter Sample Data/") {
             continue;
         }
-        let Some((record_size, _)) = gprw_record_info(&data) else {
+        let Some((record_size, _)) = gprw_record_info(data) else {
             continue;
         };
         let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
-        let path_ids = parse_derived_counter_sample_path(&path);
+        let path_ids = parse_derived_counter_sample_path(path);
         let Some(counter_names) = path_ids
             .sample_group
             .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
@@ -3344,21 +3344,21 @@ fn raw_counter_encoder_sample_metrics_from_parts(
         return Vec::new();
     }
     let encoder_sample_windows =
-        raw_counter_encoder_sample_windows(&sample_blobs, &encoder_sample_indices);
+        raw_counter_encoder_sample_windows(sample_blobs, &encoder_sample_indices);
 
     let mut metrics = Vec::new();
     for (path, data) in sample_blobs {
         if !path.contains("/Derived Counter Sample Data/") {
             continue;
         }
-        let Some((record_size, _)) = gprw_record_info(&data) else {
+        let Some((record_size, _)) = gprw_record_info(data) else {
             continue;
         };
         let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
-        let path_ids = parse_derived_counter_sample_path(&path);
+        let path_ids = parse_derived_counter_sample_path(path);
         let Some(counter_names) = path_ids
             .sample_group
             .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
@@ -3384,7 +3384,7 @@ fn raw_counter_encoder_sample_metrics_from_parts(
                 push_encoder_sample_metric_deltas(
                     &mut metrics,
                     sample_index,
-                    &path,
+                    path,
                     &path_ids,
                     counter_names,
                     start_record,
@@ -3395,7 +3395,7 @@ fn raw_counter_encoder_sample_metrics_from_parts(
                 push_encoder_sample_metric_window_totals(
                     &mut metrics,
                     sample_index,
-                    &path,
+                    path,
                     &path_ids,
                     counter_names,
                     records_in_tick_window(&records, window.start_ticks, window.end_ticks),
@@ -4963,14 +4963,14 @@ fn probe_normalized_counter_metrics_from_parts(
         if !path.contains("/Derived Counter Sample Data/") {
             continue;
         }
-        let Some((record_size, _)) = gprw_record_info(&data) else {
+        let Some((record_size, _)) = gprw_record_info(data) else {
             continue;
         };
         let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
-        let path_ids = parse_derived_counter_sample_path(&path);
+        let path_ids = parse_derived_counter_sample_path(path);
         let Some(counter_names) = path_ids
             .sample_group
             .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))

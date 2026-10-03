@@ -8,8 +8,8 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::counter;
-use crate::hw_counters;
 use crate::error::{Error, Result};
+use crate::hw_counters;
 use crate::profiler;
 use crate::trace::{KernelStat, TraceBundle};
 use crate::xcode_counters;
