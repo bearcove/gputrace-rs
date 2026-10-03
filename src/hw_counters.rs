@@ -1679,7 +1679,8 @@ pub fn format_markdown(report: &HwCounterReport) -> String {
          the encoder's own GPU kicks). Per-dispatch and per-kernel rows split samples between \
          dispatches by their measured residency on each shader core; `shrd%` says how much of \
          a row came from such shared samples. `frgn%` is the fraction of a row's time during \
-         which another process also ran on the GPU: those counts are mixed in. \
+         which GPU work not from this capture (another process, or the replayer's own) also \
+         ran: those counts are mixed in. \
          How it works and what was validated: `docs/COUNTERS_M4.md` in gputrace-rs.\n\n",
     );
     out.push_str("| column | agxps counter | unit | meaning | oracle check |\n");
