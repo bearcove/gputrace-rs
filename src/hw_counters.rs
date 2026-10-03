@@ -510,6 +510,16 @@ pub fn report(trace: &TraceBundle) -> Result<HwCounterReport> {
 
 /// Kernel name of every dispatch, keyed by its index in the capture.
 pub fn dispatch_names(summary: &profiler::ProfilerStreamDataSummary) -> BTreeMap<usize, String> {
+    for dispatch in summary.dispatches.iter().take(48) {
+        tracing::trace!(
+            index = dispatch.index,
+            pipeline_index = dispatch.pipeline_index,
+            pipeline_id = ?dispatch.pipeline_id,
+            name = ?dispatch.function_name,
+            encoder = dispatch.encoder_index,
+            "hw counters: profiler dispatch"
+        );
+    }
     summary
         .dispatches
         .iter()
