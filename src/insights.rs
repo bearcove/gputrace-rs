@@ -729,7 +729,9 @@ pub fn report_with_context(
 }
 
 /// Compute-relevant agxps limiters: each is the busy fraction of one unit,
-/// relative to that unit's peak.
+/// relative to that unit's peak. `Compute Shader Launch Limiter` is left out:
+/// it reads 82-100 % on every full-grid oracle kernel whatever bounds it
+/// (docs/COUNTERS_M4.md).
 const COMPUTE_LIMITERS: &[(&str, &str)] = &[
     ("ALU Limiter", "ALU"),
     ("F32 Limiter", "F32 ALU"),
@@ -748,7 +750,6 @@ const COMPUTE_LIMITERS: &[(&str, &str)] = &[
     ("L1 Cache Limiter", "L1 cache"),
     ("L2 Cache Limiter", "L2 cache"),
     ("MMU Limiter", "MMU (address translation)"),
-    ("Compute Shader Launch Limiter", "compute launch"),
 ];
 
 /// Kernels shorter than this (summed over their dispatches) carry too few

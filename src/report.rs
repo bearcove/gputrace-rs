@@ -476,7 +476,7 @@ impl ReportWriter {
                 report.dispatches.len(),
                 if report.foreign_kicks > 0 {
                     format!(
-                        ", `{}` kicks from other processes during the counter pass",
+                        ", `{}` kicks not from this capture during the counter pass",
                         report.foreign_kicks
                     )
                 } else {

@@ -155,7 +155,10 @@ hw-counters`):
 | alu, tgmem, lowocc: DRAM | ~0 | 0.3–0.5 GB/s of writes (see unknowns) |
 | lowocc: threads | 2,560 | 2,560 |
 | lowocc: ALU F32 instructions | 83,886,080 | 8.3885e7–8.3889e7 |
-| lowocc: Compute Occupancy | 1 SIMD group resident per core: ~2 % | 2.1 % |
+| lowocc: Compute Occupancy | two 32 KiB threadgroups (one SIMD group each) fit a core: 2 of 96 SIMD groups | 2.1 % (`Compute Simdgroups Inflight Per Shader Core` 1.97, `L1 Threadgroup Bytes Occupancy` 63.9 KB) |
+| alu, tgmem: Compute Occupancy | 3 × 32 SIMD groups of 1024-thread groups | 91 % (87.9 of 96) |
+| copy, read: Compute Occupancy | | 33 %, with `Occupancy Manager Target` 35 % (100 % on the other oracles): the occupancy manager caps DRAM-streaming kernels |
+| alu: F32 Limiter | F32-bound | 99 % |
 | `oracle_mixed`: threads, F32 instructions | sums of the five | exact (4,786,688; 6.1444e9) |
 
 Per dispatch inside `oracle_mixed`, against the known values (same four
@@ -188,8 +191,16 @@ expected bytes again.
   counts are complete. Not explained; a larger guard band (up to 16384 ticks)
   does not recover it.
 - **ALU Utilization.** 55 % on a pure F32 FMA kernel whose F32 Utilization is
-  87 %. Its definition (which pipes, which peak) is not known; prefer the
-  per-type utilizations.
+  87 % and F32 Limiter 99 %. Its definition (which pipes, which peak) is not
+  known; prefer the per-type utilizations and limiters.
+- **Launch limiter.** `Compute Shader Launch Limiter` reads 82–100 % on every
+  full-grid oracle (ALU-, DRAM- and threadgroup-bound alike) while `Compute
+  Shader Launch Utilization` is under 3 %: it rises whenever the cores are
+  full and launches wait. Insights ignore it. `Shader Core Limiter` equals
+  `Instruction Issue Limiter` on every oracle.
+- **No threadgroup-memory limiter.** The limiter pass on M4 does not carry
+  the raw counters of `Threadgroup Load Limiter`; the threadgroup oracle's
+  highest limiter is `Instruction Issue Limiter` (70 %).
 - **DRAM write floor.** Kernels that write almost nothing show 0.3–0.5 GB/s of
   DRAM writes (e.g. 1.9 MB for the ALU oracle's 0.66 MB of stores). Writes
   also land late (−2 % for copy, half the read kernel's 1 MiB): the fabric
