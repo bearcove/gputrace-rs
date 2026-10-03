@@ -137,18 +137,28 @@ a typical Xcode capture.
 
 `agxps_aps_gpu_find_supported_revision(gen, variant, rev_in, *rev_out)`
 exhaustively probed: 26 supported (gen, variant) pairs across gens
-15..20, all rev=1. **M4 Pro is `gen=16, variant=3`** — verified
-empirically: only that combo decoded our trace's `Profiling_f_0.raw`
-without `Encountered tile start while a tile was still active` errors.
+15..20, all rev=1.
 
 ```
 gen=15 variant=4..7
-gen=16 variant=3..6     ← gen=16 variant=3 = M4 Pro
+gen=16 variant=3..6
 gen=17 variant=2..7
 gen=18 variant=1..4
 gen=19 variant=2..7
 gen=20 variant=2..3
 ```
+
+**The variant is the GPU's size, not its marketing name.** The derived
+counter GPU descriptors (`agxps_derived_counter_gpu_descriptor_create`)
+give each variant's shape; for gen 16: variant 3 = 6 cores, 4 = 10 cores
+(M4, `G16G`, 1 mGPU), 5 = 20 cores in 2 mGPUs (M4 Pro, `G16S`), 6 = 40
+cores. gputrace picks the variant whose core and mGPU counts match the
+`Configuration Variables` MTLReplayer logs into the profile
+(`num_cores`, `num_mgpus`; `hw_counters::agxps_gpu_for_profile`). An
+earlier version of this page said "M4 Pro is variant 3" because variant 3
+decoded `Profiling_f_0.raw` without tile errors; the timing decode is
+tolerant of the wrong size, but derived counters are not (their formulas
+use the core and L2-bank counts), so the matched variant is used for both.
 
 `agxps_gpu_create(gen, variant, rev, false)` allocates a 0x28-byte
 heap struct with `[gen u32][variant u32][rev u32][rev_with_aps_fallback
