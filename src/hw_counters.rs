@@ -1250,7 +1250,7 @@ fn attribute(
                 // No traced clique of this kick in the sample (clique ends are
                 // estimates): charge the dispatches whose activity span on
                 // this stream covers it, by overlap, else the latest one to
-                // have started. Time stays uncredited.
+                // have started, with the kick's time in the sample.
                 let spans = hulls
                     .get(kick)
                     .map(|spans| {
@@ -1277,12 +1277,14 @@ fn attribute(
                     }
                 }
                 let total = spans.iter().map(|(_, ticks)| *ticks).sum::<u64>();
+                let kick_ticks = kick_overlap.get(kick).copied().unwrap_or(0) as f64;
                 for (dispatch, ticks) in spans {
-                    out.dispatches.entry(dispatch).or_default().add_counts(
-                        stream,
-                        sample,
-                        share * ticks as f64 / total as f64,
-                        true,
+                    let fraction = ticks as f64 / total as f64;
+                    let accum = out.dispatches.entry(dispatch).or_default();
+                    accum.add_counts(stream, sample, share * fraction, true);
+                    accum.add_time(
+                        cycles * kick_ticks * fraction / duration,
+                        kick_ticks * fraction * timebase_ns * 1e-9,
                     );
                 }
                 continue;
