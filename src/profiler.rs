@@ -1034,16 +1034,6 @@ pub fn format_report(report: &ProfilerReport) -> String {
     out
 }
 
-fn format_counter_metric_value(value: f64, unit: Option<&str>) -> String {
-    match unit {
-        Some("%") => format!("{value:.2}%"),
-        Some("GB/s") => format!("{value:.2} GB/s"),
-        Some("bytes") => format!("{value:.0} bytes"),
-        Some("count") => format!("{value:.0}"),
-        _ => format!("{value:.3}"),
-    }
-}
-
 fn top_dispatch_functions(summary: &ProfilerStreamDataSummary) -> Vec<(String, usize, u64)> {
     let mut by_name = BTreeMap::<String, (usize, u64)>::new();
     for dispatch in &summary.dispatches {
