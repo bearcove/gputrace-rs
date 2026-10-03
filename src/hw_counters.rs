@@ -1016,12 +1016,12 @@ fn usc_activity(
     // Command starts per kick, to bound cliques with no measured duration
     // by the next command's start (dispatches of an encoder mostly run
     // back to back behind barriers).
-    let mut starts_by_kick = BTreeMap::<u64, Vec<u64>>::new();
-    for command in &profile.commands {
+    let mut starts_by_kick = BTreeMap::<u64, Vec<(u64, usize)>>::new();
+    for (index, command) in profile.commands.iter().enumerate() {
         starts_by_kick
             .entry(command.software_id)
             .or_default()
-            .push(command.start_ticks);
+            .push((command.start_ticks, index));
     }
     for starts in starts_by_kick.values_mut() {
         starts.sort_unstable();
@@ -1039,9 +1039,13 @@ fn usc_activity(
             match owner.and_then(|owner| typical.get(&owner)) {
                 Some(duration) => end = end.min(clique.start_ticks + duration),
                 None => {
-                    if let Some(next) = starts_by_kick
-                        .get(&kick_info.software_id)
-                        .and_then(|starts| starts.iter().find(|start| **start > clique.start_ticks))
+                    let own = owner.map(|(_, command)| command);
+                    if let Some((next, _)) =
+                        starts_by_kick.get(&kick_info.software_id).and_then(|starts| {
+                            starts.iter().find(|(start, command)| {
+                                *start > clique.start_ticks && Some(*command) != own
+                            })
+                        })
                     {
                         end = end.min(*next);
                     }
