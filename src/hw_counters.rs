@@ -1137,6 +1137,22 @@ fn attribute(
     out: &mut Accums,
 ) {
     let guard = attribution_guard_ticks();
+    // Per kick: each dispatch's span from its first clique start to its
+    // last clique end on this stream.
+    let mut hull = BTreeMap::<(usize, usize), (u64, u64)>::new();
+    for item in activity {
+        if let Some(dispatch) = item.dispatch {
+            let span = hull
+                .entry((item.kick, dispatch))
+                .or_insert((item.start, item.end));
+            span.0 = span.0.min(item.start);
+            span.1 = span.1.max(item.end);
+        }
+    }
+    let mut hulls = BTreeMap::<usize, Vec<(usize, u64, u64)>>::new();
+    for ((kick, dispatch), (a, b)) in hull {
+        hulls.entry(kick).or_default().push((dispatch, a, b));
+    }
     let mut next = 0;
     let mut active = Vec::<Activity>::new();
     for sample in 1..stream.ends.len() {
@@ -1227,6 +1243,30 @@ fn attribute(
                 .map(|(_, (resident, _))| *resident)
                 .sum::<u64>();
             if kick_residency == 0 {
+                // No traced clique of this kick in the sample (clique ends are
+                // estimates): charge the dispatches whose activity span on
+                // this stream covers it, by overlap. Time stays uncredited.
+                let spans = hulls
+                    .get(kick)
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .filter_map(|(dispatch, a, b)| {
+                                let ticks = overlap(start, end, *a, *b);
+                                (ticks > 0).then_some((*dispatch, ticks))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let total = spans.iter().map(|(_, ticks)| *ticks).sum::<u64>();
+                for (dispatch, ticks) in spans {
+                    out.dispatches.entry(dispatch).or_default().add_counts(
+                        stream,
+                        sample,
+                        share * ticks as f64 / total as f64,
+                        true,
+                    );
+                }
                 continue;
             }
             for ((owner_kick, dispatch), (resident, intervals)) in &by_dispatch {
