@@ -8,6 +8,7 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::counter;
+use crate::hw_counters;
 use crate::error::{Error, Result};
 use crate::profiler;
 use crate::trace::{KernelStat, TraceBundle};
@@ -52,13 +53,16 @@ pub struct ShaderEntry {
     pub estimated_bytes_accessed: Option<u64>,
     pub bottlenecks: Vec<String>,
     pub optimization_hints: Vec<String>,
+    /// Hardware counters (limiter pass): `Compute Occupancy`.
     pub occupancy_percent: Option<f64>,
-    pub occupancy_confidence: Option<f64>,
+    /// Hardware counters (limiter pass): `ALU Utilization`.
     pub alu_utilization_percent: Option<f64>,
     pub kernel_alu_performance: Option<f64>,
     pub weighted_cost: Option<f64>,
     pub weighted_percent_of_total: Option<f64>,
+    /// Hardware counters (limiter pass): `L2 Cache Limiter`.
     pub last_level_cache_percent: Option<f64>,
+    /// Hardware counters (limiter pass): `AF Read Bandwidth` + `AF Write Bandwidth`.
     pub device_memory_bandwidth_gbps: Option<f64>,
     pub gpu_read_bandwidth_gbps: Option<f64>,
     pub gpu_write_bandwidth_gbps: Option<f64>,
@@ -170,7 +174,7 @@ pub fn report_with_context(
     search_paths: &[PathBuf],
     profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
     precomputed_profiling_address_summary: Option<&counter::ProfilingAddressProbeReport>,
-    precomputed_limiter_metrics: Option<&[counter::CounterLimiter]>,
+    hw_counter_report: Option<&hw_counters::HwCounterReport>,
 ) -> Result<ShaderReport> {
     let index = ShaderSourceIndex::build_for_trace(&trace.path, search_paths)?;
     let profiling_address_summary_owned;
@@ -180,13 +184,24 @@ pub fn report_with_context(
         profiling_address_summary_owned = counter::probe_profiling_addresses(trace).ok();
         profiling_address_summary_owned.as_ref()
     };
-    let limiter_metrics_owned;
-    let limiter_metrics = if let Some(metrics) = precomputed_limiter_metrics {
-        metrics
-    } else {
-        limiter_metrics_owned = counter::extract_limiters_for_trace(&trace.path);
-        &limiter_metrics_owned
+    let hw_counter_report_owned;
+    let hw_counter_report = match hw_counter_report {
+        Some(report) => Some(report),
+        None => {
+            hw_counter_report_owned = hw_counters::cached_report(&trace.path);
+            hw_counter_report_owned.as_deref()
+        }
     };
+    // Per-kernel hardware counters from the limiter pass, keyed by kernel name.
+    let hw_by_name = hw_counter_report
+        .map(|report| {
+            report
+                .kernels
+                .iter()
+                .map(|row| (row.label.as_str(), row))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
     let regions = trace.command_buffer_regions().unwrap_or_default();
     let mut simd_groups_by_name = BTreeMap::<String, u64>::new();
@@ -211,8 +226,6 @@ pub fn report_with_context(
     let mut sample_count_by_name = BTreeMap::<String, usize>::new();
     let mut density_sum_by_name = BTreeMap::<String, f64>::new();
     let mut density_count_by_name = BTreeMap::<String, usize>::new();
-    let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
-    let mut limiter_by_name = BTreeMap::<String, (f64, f64, f64, usize)>::new();
     let mut profiling_address_hits_by_name = BTreeMap::<String, usize>::new();
     let mut total_profiling_address_hits = 0usize;
     let mut pipeline_stats_by_addr = BTreeMap::<u64, profiler::ProfilerPipelineStats>::new();
@@ -240,39 +253,6 @@ pub fn report_with_context(
                 .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
             *execution_cost_by_name.entry(name.clone()).or_default() += cost.cost_percent;
             *execution_cost_samples_by_name.entry(name).or_default() += cost.sample_count;
-        }
-        for occupancy in &summary.occupancies {
-            for dispatch in summary
-                .dispatches
-                .iter()
-                .filter(|dispatch| dispatch.encoder_index == occupancy.encoder_index)
-            {
-                let name = dispatch
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-                let entry = occupancy_by_name.entry(name).or_default();
-                entry.0 += occupancy.occupancy_percent;
-                entry.1 += occupancy.confidence;
-                entry.2 += 1;
-            }
-        }
-        for limiter in limiter_metrics {
-            for dispatch in summary
-                .dispatches
-                .iter()
-                .filter(|dispatch| dispatch.encoder_index == limiter.encoder_index)
-            {
-                let name = dispatch
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-                let entry = limiter_by_name.entry(name).or_default();
-                entry.0 += limiter.alu_utilization.unwrap_or(0.0);
-                entry.1 += limiter.last_level_cache.unwrap_or(0.0);
-                entry.2 += limiter.device_memory_bandwidth_gbps.unwrap_or(0.0);
-                entry.3 += 1;
-            }
         }
         for pipeline in &summary.pipelines {
             if let Some(stats) = &pipeline.stats {
@@ -332,24 +312,7 @@ pub fn report_with_context(
                         .get(&kernel_name)
                         .map(|sum| *sum / count as f64)
                 });
-            let occupancy = occupancy_by_name.get(&kernel_name).and_then(
-                |(occupancy_sum, confidence_sum, count)| {
-                    (*count > 0).then_some((
-                        occupancy_sum / *count as f64,
-                        confidence_sum / *count as f64,
-                    ))
-                },
-            );
-            let limiter =
-                limiter_by_name
-                    .get(&kernel_name)
-                    .and_then(|(alu_sum, llc_sum, bw_sum, count)| {
-                        (*count > 0).then_some((
-                            alu_sum / *count as f64,
-                            llc_sum / *count as f64,
-                            bw_sum / *count as f64,
-                        ))
-                    });
+            let hw = hw_by_name.get(kernel_name.as_str()).copied();
             let xcode_counter_match = xcode_counter_data
                 .as_ref()
                 .and_then(|data| match_xcode_counters(&kernel_name, data));
@@ -424,20 +387,19 @@ pub fn report_with_context(
                 estimated_bytes_accessed,
                 bottlenecks: Vec::new(),
                 optimization_hints: Vec::new(),
-                occupancy_percent: xcode_counter_match
-                    .and_then(|entry| entry.occupancy_percent)
-                    .or_else(|| occupancy.map(|(value, _)| value)),
-                occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
-                alu_utilization_percent: limiter
-                    .map(|(alu, _, _)| alu)
+                occupancy_percent: hw
+                    .and_then(|row| row.percent("Compute Occupancy"))
+                    .or(xcode_counter_match.and_then(|entry| entry.occupancy_percent)),
+                alu_utilization_percent: hw
+                    .and_then(|row| row.percent("ALU Utilization"))
                     .or(xcode_counter_match.and_then(|entry| entry.alu_utilization_percent)),
                 kernel_alu_performance: xcode_counter_match
                     .and_then(|entry| entry.kernel_alu_performance),
                 weighted_cost: None,
                 weighted_percent_of_total: None,
-                last_level_cache_percent: limiter.map(|(_, llc, _)| llc),
-                device_memory_bandwidth_gbps: limiter
-                    .map(|(_, _, bw)| bw)
+                last_level_cache_percent: hw.and_then(|row| row.percent("L2 Cache Limiter")),
+                device_memory_bandwidth_gbps: hw
+                    .and_then(|row| row.dram_gbps())
                     .or(xcode_counter_match.and_then(|entry| entry.device_memory_bandwidth_gbps)),
                 gpu_read_bandwidth_gbps: xcode_counter_match
                     .and_then(|entry| entry.gpu_read_bandwidth_gbps),
@@ -1204,7 +1166,7 @@ pub fn format_report(report: &ShaderReport) -> String {
 
 pub fn format_csv(report: &ShaderReport) -> String {
     let mut out = String::new();
-    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,profiling_address_hits,profiling_address_percent,sample_count,avg_sampling_density,threadgroups_x,threadgroups_y,threadgroups_z,threads_per_group_x,threads_per_group_y,threads_per_group_z,total_threadgroups,threads_per_threadgroup,total_threads,estimated_occupancy_percent,compute_ratio,classification,estimated_bandwidth_gbps,estimated_bytes_accessed,bottlenecks,optimization_hints,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
+    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,profiling_address_hits,profiling_address_percent,sample_count,avg_sampling_density,threadgroups_x,threadgroups_y,threadgroups_z,threads_per_group_x,threads_per_group_y,threads_per_group_z,total_threadgroups,threads_per_threadgroup,total_threads,estimated_occupancy_percent,compute_ratio,classification,estimated_bandwidth_gbps,estimated_bytes_accessed,bottlenecks,optimization_hints,occupancy_percent,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
     for shader in &report.shaders {
         let source_file = shader
             .source_file
@@ -1248,7 +1210,6 @@ pub fn format_csv(report: &ShaderReport) -> String {
             format!("\"{}\"", bottlenecks.replace('"', "\"\"")),
             format!("\"{}\"", optimization_hints.replace('"', "\"\"")),
             option_csv(shader.occupancy_percent),
-            option_csv(shader.occupancy_confidence),
             option_csv(shader.alu_utilization_percent),
             option_csv(shader.last_level_cache_percent),
             option_csv(shader.device_memory_bandwidth_gbps),
@@ -1792,15 +1753,13 @@ fn attribute_line_costs(lines: &mut [AttributedSourceLine], context: LineCostCon
     }
 
     if let Some(alu_utilization) = context.alu_utilization_percent {
-        let normalized = normalize_percent_like(alu_utilization);
-        if normalized > 50.0 {
-            compute_weight += (normalized - 50.0) / 100.0;
+        if alu_utilization > 50.0 {
+            compute_weight += (alu_utilization - 50.0) / 100.0;
         }
     }
     if let Some(llc) = context.last_level_cache_percent {
-        let normalized = normalize_percent_like(llc);
-        if normalized > 5.0 {
-            memory_weight += (normalized / 100.0).min(0.75);
+        if llc > 5.0 {
+            memory_weight += (llc / 100.0).min(0.75);
         }
     }
     if let Some(bandwidth) = context.device_memory_bandwidth_gbps {
@@ -1969,10 +1928,6 @@ fn attribute_compiler_line_costs(
     }
 }
 
-fn normalize_percent_like(value: f64) -> f64 {
-    if value <= 1.0 { value * 100.0 } else { value }
-}
-
 fn line_hints(line: &AttributedSourceLine) -> Vec<String> {
     let mut hints = Vec::new();
     if !line.hotspot {
@@ -2112,7 +2067,6 @@ mod tests {
                 stats: None,
             }],
             execution_costs: vec![],
-            occupancies: vec![],
             dispatches: vec![
                 profiler::ProfilerDispatch {
                     index: 0,
@@ -2194,7 +2148,6 @@ mod tests {
                     "Optimize memory access patterns, consider threadgroup memory usage".into(),
                 ],
                 occupancy_percent: Some(37.5),
-                occupancy_confidence: Some(0.8),
                 alu_utilization_percent: Some(61.0),
                 kernel_alu_performance: Some(2048.0),
                 weighted_cost: Some(9.85),
@@ -2299,7 +2252,6 @@ mod tests {
                     "Optimize memory access patterns, consider threadgroup memory usage".into(),
                 ],
                 occupancy_percent: Some(37.5),
-                occupancy_confidence: Some(0.8),
                 alu_utilization_percent: Some(61.0),
                 last_level_cache_percent: Some(0.04),
                 device_memory_bandwidth_gbps: Some(8.2),
@@ -2372,7 +2324,6 @@ mod tests {
             bottlenecks: Vec::new(),
             optimization_hints: Vec::new(),
             occupancy_percent: None,
-            occupancy_confidence: None,
             alu_utilization_percent: Some(61.0),
             last_level_cache_percent: None,
             device_memory_bandwidth_gbps: None,

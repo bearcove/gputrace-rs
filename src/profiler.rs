@@ -48,14 +48,6 @@ pub struct ProfilerExecutionCost {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct ProfilerOccupancy {
-    pub encoder_index: usize,
-    pub occupancy_percent: f64,
-    pub sample_count: usize,
-    pub confidence: f64,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProfilerDispatch {
     pub index: usize,
     pub pipeline_index: usize,
@@ -131,7 +123,6 @@ pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
     pub execution_costs: Vec<ProfilerExecutionCost>,
-    pub occupancies: Vec<ProfilerOccupancy>,
     pub dispatches: Vec<ProfilerDispatch>,
     pub encoder_timings: Vec<ProfilerEncoderTiming>,
     pub timeline: Option<ProfilerTimelineInfo>,
@@ -148,7 +139,6 @@ pub struct ProfilerReport {
     pub stream_data_present: bool,
     pub stream_data_summary: Option<ProfilerStreamDataSummary>,
     pub limiter_metrics: Vec<counter::CounterLimiter>,
-    pub raw_counter_metrics: Vec<counter::CounterFileMetric>,
     pub timeline_file_count: usize,
     pub counter_file_count: usize,
     pub profiling_file_count: usize,
@@ -260,15 +250,11 @@ pub fn report_with_stream_data_summary<P: AsRef<Path>>(
         Some(summary)
     } else if stream_data_present {
         let stream_data_path = profiler_directory.join("streamData");
-        Some(parse_stream_data(
-            &stream_data_path,
-            Some(&profiler_directory),
-        )?)
+        Some(parse_stream_data(&stream_data_path)?)
     } else {
         None
     };
     let limiter_metrics = counter::extract_limiters(&profiler_directory);
-    let raw_counter_metrics = counter::extract_counter_file_metrics(&profiler_directory);
 
     let mut notes = Vec::new();
     if !stream_data_present {
@@ -282,7 +268,7 @@ pub fn report_with_stream_data_summary<P: AsRef<Path>>(
         );
     }
     notes.push(
-        "Profiling_f_* occupancy candidates and Counters_f_* limiter metrics are parsed offline; pipeline-id byte scans are retained as a debug signal, not treated as Xcode Cost."
+        "Encoder limiters come from the limiter-pass hardware counters (agxps; see counters.md); pipeline-id byte scans are retained as a debug signal, not treated as Xcode Cost."
             .to_owned(),
     );
 
@@ -292,7 +278,6 @@ pub fn report_with_stream_data_summary<P: AsRef<Path>>(
         stream_data_present,
         stream_data_summary,
         limiter_metrics,
-        raw_counter_metrics,
         timeline_file_count,
         counter_file_count,
         profiling_file_count,
@@ -543,7 +528,7 @@ pub fn stream_data_summary<P: AsRef<Path>>(path: P) -> Result<ProfilerStreamData
     if !stream_data_path.is_file() {
         return Err(Error::MissingFile(stream_data_path));
     }
-    let mut summary = parse_stream_data(&stream_data_path, Some(&profiler_directory))?;
+    let mut summary = parse_stream_data(&stream_data_path)?;
     if let Some(names) = trace_function_names(&input_path) {
         summary.fill_function_names(&names);
     }
@@ -695,8 +680,7 @@ fn coverage_group(
         "profiling" => (
             "heuristic-only",
             vec![
-                "current profiler command can scan pipeline ids and occupancy-looking values"
-                    .to_owned(),
+                "current profiler command can scan pipeline ids".to_owned(),
             ],
             vec![
                 "decode MIO/USC profiling records from Profiling_f_*".to_owned(),
@@ -704,18 +688,13 @@ fn coverage_group(
             ],
         ),
         "counter" => (
-            "partial-heuristic",
+            "decoded",
             vec![
-                "legacy Counters_f_* metric extraction exists for a subset of known counters"
-                    .to_owned(),
-                "streamData APSCounterData/GPRWCNTR path is decoded separately".to_owned(),
-                "XRGPUATRCImporter does not recognize exported Counters_f_* files as RDE streams"
+                "limiter-pass Counters_f_* (APS_USC) and RDE GPRWCNTR samples are decoded with agxps and attributed to encoders, dispatches and kernels (hw_counters, counters.md)"
                     .to_owned(),
             ],
             vec![
-                "join sampled counters to dispatch/shader windows when timestamps line up"
-                    .to_owned(),
-                "map the remaining APS_USC Counters_f_* payload semantics if they prove useful"
+                "per-dispatch values for dispatches that overlap on the same cores are estimates (split by residency)"
                     .to_owned(),
             ],
         ),
@@ -938,18 +917,6 @@ pub fn format_report(report: &ProfilerReport) -> String {
                 ));
             }
         }
-        if !summary.occupancies.is_empty() {
-            out.push_str("top encoder occupancies\n");
-            for occupancy in summary.occupancies.iter().take(5) {
-                out.push_str(&format!(
-                    "  - encoder {}: {:.2}% ({} samples, confidence {:.2})\n",
-                    occupancy.encoder_index,
-                    occupancy.occupancy_percent,
-                    occupancy.sample_count,
-                    occupancy.confidence
-                ));
-            }
-        }
         let mut pipelines_with_stats = summary
             .pipelines
             .iter()
@@ -999,10 +966,10 @@ pub fn format_report(report: &ProfilerReport) -> String {
         out.push_str("-----------------------\n");
         for limiter in report.limiter_metrics.iter().take(8) {
             out.push_str(&format!(
-                "  - encoder {}: occ_mgr={} alu={} launch={} instr={} int_complex={} ctrl={} f32={} l1={} llc={} dev_bw={} l1r_bw={} l1w_bw={}\n",
+                "  - encoder {}: occ={} alu={} launch={} instr={} int_complex={} ctrl={} f32={} l1={} llc={} dev_bw={} l1r_bw={} l1w_bw={}\n",
                 limiter.encoder_index,
                 limiter
-                    .occupancy_manager
+                    .occupancy
                     .map(|value| format!("{value:.2}%"))
                     .unwrap_or_else(|| "-".to_owned()),
                 limiter
@@ -1053,26 +1020,6 @@ pub fn format_report(report: &ProfilerReport) -> String {
         }
     }
 
-    if !report.raw_counter_metrics.is_empty() {
-        out.push_str("\nraw counter file metrics\n");
-        out.push_str("------------------------\n");
-        for metric in report.raw_counter_metrics.iter().take(16) {
-            out.push_str(&format!(
-                "  - encoder {} Counters_f_{} {}: median={} mean={} min={} max={} records={} samples={} confidence={:.2}\n",
-                metric.encoder_index,
-                metric.file_index,
-                metric.metric_name,
-                format_counter_metric_value(metric.representative_value, metric.unit.as_deref()),
-                format_counter_metric_value(metric.mean_value, metric.unit.as_deref()),
-                format_counter_metric_value(metric.min_value, metric.unit.as_deref()),
-                format_counter_metric_value(metric.max_value, metric.unit.as_deref()),
-                metric.record_count,
-                metric.sample_count,
-                metric.confidence
-            ));
-        }
-    }
-
     for note in &report.notes {
         out.push_str(&format!("~ {note}\n"));
     }
@@ -1117,10 +1064,7 @@ fn top_dispatch_functions(summary: &ProfilerStreamDataSummary) -> Vec<(String, u
     rows
 }
 
-fn parse_stream_data(
-    path: &Path,
-    profiler_dir: Option<&Path>,
-) -> Result<ProfilerStreamDataSummary> {
+fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
     let plist = Value::from_file(path)?;
     let archive = plist
         .as_dictionary()
@@ -1138,7 +1082,6 @@ fn parse_stream_data(
     let (pipeline_addresses, pipeline_functions) =
         extract_pipeline_info(objects, root, &function_names);
     let pipelines = extract_pipelines(objects, root, &pipeline_addresses, &pipeline_functions);
-    let occupancies = profiler_dir.map(extract_occupancies).unwrap_or_default();
     let encoder_timings = extract_encoder_timings(objects, root);
     let mut dispatches = extract_dispatches(objects, root, &pipelines);
     let timeline = extract_timeline(objects, root);
@@ -1157,103 +1100,10 @@ fn parse_stream_data(
             .sum(),
         pipelines,
         execution_costs: Vec::new(),
-        occupancies,
         dispatches,
         encoder_timings,
         timeline,
     })
-}
-
-fn extract_occupancies(profiler_dir: &Path) -> Vec<ProfilerOccupancy> {
-    let Ok(entries) = fs::read_dir(profiler_dir) else {
-        return Vec::new();
-    };
-
-    let mut files = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let index = name
-                .strip_prefix("Profiling_f_")
-                .and_then(|rest| rest.strip_suffix(".raw"))
-                .and_then(|rest| rest.parse::<usize>().ok())?;
-            let path = entry.path();
-            path.is_file().then_some((index, path))
-        })
-        .collect::<Vec<_>>();
-    files.sort_by_key(|(index, _)| *index);
-
-    files
-        .into_iter()
-        .filter_map(|(encoder_index, path)| {
-            let data = fs::read(path).ok()?;
-            let candidates = extract_occupancy_candidates(&data);
-            if candidates.is_empty() {
-                return None;
-            }
-            Some(ProfilerOccupancy {
-                encoder_index,
-                occupancy_percent: median(&candidates) * 100.0,
-                sample_count: candidates.len(),
-                confidence: occupancy_confidence(&candidates),
-            })
-        })
-        .collect()
-}
-
-fn extract_occupancy_candidates(data: &[u8]) -> Vec<f64> {
-    const MIN_OCCUPANCY: f32 = 0.0001;
-    const MAX_OCCUPANCY: f32 = 1.0;
-    const NOISE_THRESHOLD: usize = 20;
-
-    let mut value_frequency = BTreeMap::<u32, usize>::new();
-    for chunk in data.chunks_exact(mem::size_of::<u32>()) {
-        let bits = u32::from_le_bytes(chunk.try_into().unwrap());
-        let value = f32::from_bits(bits);
-        if value.is_finite() && (MIN_OCCUPANCY..=MAX_OCCUPANCY).contains(&value) {
-            *value_frequency.entry(bits).or_default() += 1;
-        }
-    }
-
-    value_frequency
-        .into_iter()
-        .filter(|(_, count)| *count <= NOISE_THRESHOLD)
-        .map(|(bits, _)| f32::from_bits(bits) as f64)
-        .collect()
-}
-
-fn median(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|left, right| left.total_cmp(right));
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
-    } else {
-        sorted[mid]
-    }
-}
-
-fn occupancy_confidence(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let sample_confidence = (values.len() as f64 / 10.0).min(1.0);
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance = values
-        .iter()
-        .map(|value| {
-            let delta = value - mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / values.len() as f64;
-    let variance_confidence = 1.0 - (variance / 0.01).min(1.0);
-    0.7 * sample_confidence + 0.3 * variance_confidence
 }
 
 fn extract_function_names(objects: &[Value], root: &Dictionary) -> Vec<String> {
@@ -2484,7 +2334,7 @@ mod tests {
             .to_file_binary(&stream_data_path)
             .unwrap();
 
-        let summary = parse_stream_data(&stream_data_path, None).unwrap();
+        let summary = parse_stream_data(&stream_data_path).unwrap();
         assert_eq!(summary.function_names, vec!["kernel_main".to_owned()]);
         assert_eq!(summary.num_pipelines, 1);
         assert_eq!(summary.num_encoders, 1);
@@ -2520,7 +2370,7 @@ mod tests {
             .to_file_binary(&stream_data_path)
             .unwrap();
 
-        let summary = parse_stream_data(&stream_data_path, None).unwrap();
+        let summary = parse_stream_data(&stream_data_path).unwrap();
         let timeline = summary.timeline.expect("timeline metadata");
         assert_eq!(timeline.timebase_numer, 125);
         assert_eq!(timeline.timebase_denom, 3);
@@ -2555,7 +2405,7 @@ mod tests {
             .to_file_binary(&stream_data_path)
             .unwrap();
 
-        let summary = parse_stream_data(&stream_data_path, None).unwrap();
+        let summary = parse_stream_data(&stream_data_path).unwrap();
         let timeline = summary.timeline.expect("timeline metadata");
         assert_eq!(timeline.encoder_profiles.len(), 1);
         let profile = &timeline.encoder_profiles[0];
@@ -2634,12 +2484,6 @@ mod tests {
                     sample_count: 5,
                     cost_percent: 62.5,
                 }],
-                occupancies: vec![ProfilerOccupancy {
-                    encoder_index: 0,
-                    occupancy_percent: 37.5,
-                    sample_count: 4,
-                    confidence: 0.8,
-                }],
                 dispatches: vec![ProfilerDispatch {
                     index: 0,
                     pipeline_index: 0,
@@ -2692,7 +2536,7 @@ mod tests {
             }),
             limiter_metrics: vec![counter::CounterLimiter {
                 encoder_index: 0,
-                occupancy_manager: Some(72.0),
+                occupancy: Some(72.0),
                 alu_utilization: Some(61.0),
                 compute_shader_launch: Some(0.18),
                 instruction_throughput: Some(1.2),
@@ -2704,21 +2548,6 @@ mod tests {
                 device_memory_bandwidth_gbps: Some(8.2),
                 buffer_l1_read_bandwidth_gbps: Some(2.3),
                 buffer_l1_write_bandwidth_gbps: Some(0.7),
-            }],
-            raw_counter_metrics: vec![counter::CounterFileMetric {
-                file_index: 12,
-                metric_name: "ALU Utilization".to_owned(),
-                unit: Some("%".to_owned()),
-                encoder_index: 0,
-                record_count: 2,
-                sample_count: 6,
-                aggregation: "average".to_owned(),
-                total_value: 102.0,
-                representative_value: 17.0,
-                min_value: 12.0,
-                max_value: 22.0,
-                mean_value: 17.0,
-                confidence: 0.75,
             }],
             timeline_file_count: 1,
             counter_file_count: 2,
@@ -2745,10 +2574,7 @@ mod tests {
         assert!(text.contains("encoder_profiles=1"));
         assert!(text.contains("execution cost"));
         assert!(text.contains("counter limiter summary"));
-        assert!(text.contains("raw counter file metrics"));
-        assert!(text.contains("Counters_f_12 ALU Utilization"));
-        assert!(text.contains("occ_mgr=72.00%"));
-        assert!(text.contains("encoder 0: 37.50%"));
+        assert!(text.contains("occ=72.00%"));
         assert!(text.contains("regs=32"));
     }
 

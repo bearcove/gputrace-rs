@@ -38,8 +38,6 @@ pub struct CounterExportRow {
     pub sample_count: usize,
     pub avg_sampling_density: Option<f64>,
     pub occupancy_percent: Option<f64>,
-    pub occupancy_confidence: Option<f64>,
-    pub occupancy_manager_percent: Option<f64>,
     pub alu_utilization_percent: Option<f64>,
     pub shader_launch_limiter_percent: Option<f64>,
     pub instruction_throughput_percent: Option<f64>,
@@ -133,13 +131,16 @@ pub fn report_with_context(
         .into_iter()
         .map(|limiter| (limiter.encoder_index, limiter))
         .collect::<BTreeMap<_, _>>();
+    let occupancy_by_encoder = limiters_by_encoder
+        .iter()
+        .filter_map(|(encoder, limiter)| Some((*encoder, limiter.occupancy?)))
+        .collect::<BTreeMap<_, _>>();
 
     let mut execution_cost_by_name = BTreeMap::<String, (f64, usize)>::new();
     let mut sample_stats_by_name = BTreeMap::<String, (usize, f64, usize)>::new();
     let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
     let mut profiler_dispatches_by_name =
         BTreeMap::<String, Vec<&profiler::ProfilerDispatch>>::new();
-    let mut occupancy_by_encoder = BTreeMap::<usize, (f64, f64)>::new();
     if let Some(summary) = profiler_summary {
         for cost in &summary.execution_costs {
             let name = cost
@@ -170,12 +171,6 @@ pub fn report_with_context(
                     .entry(name.clone())
                     .or_insert_with(|| stats.clone());
             }
-        }
-        for occupancy in &summary.occupancies {
-            occupancy_by_encoder.insert(
-                occupancy.encoder_index,
-                (occupancy.occupancy_percent, occupancy.confidence),
-            );
         }
     }
 
@@ -236,14 +231,13 @@ pub fn report_with_context(
             .as_ref()
             .and_then(|name| pipeline_stats_by_name.get(name));
         let limiter = limiters_by_encoder.get(&encoder.index);
-        let occupancy = occupancy_by_encoder.get(&encoder.index).copied();
         let row_metrics = BTreeMap::<String, f64>::new();
         let row_metric = |name: &str| row_metrics.get(name).copied();
         let kernel_invocations = row_metric("Kernel Invocations")
             .map(|value| value.round().max(0.0) as usize)
             .unwrap_or(encoder.dispatch_count);
         let occupancy_percent =
-            row_metric("Kernel Occupancy").or_else(|| occupancy.map(|(percent, _)| percent));
+            row_metric("Kernel Occupancy").or_else(|| limiter.and_then(|limiter| limiter.occupancy));
         let alu_utilization_percent = row_metric("ALU Utilization")
             .or_else(|| limiter.and_then(|limiter| limiter.alu_utilization));
         let device_memory_bandwidth_gbps = row_metric("Device Memory Bandwidth")
@@ -309,29 +303,21 @@ pub fn report_with_context(
             sample_count,
             avg_sampling_density,
             occupancy_percent,
-            occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
-            occupancy_manager_percent: limiter.and_then(|limiter| limiter.occupancy_manager),
             alu_utilization_percent,
             shader_launch_limiter_percent: row_metric("Compute Shader Launch Limiter")
-                .or_else(|| limiter.and_then(|limiter| limiter.compute_shader_launch))
-                .map(normalize_percent_like),
+                .or_else(|| limiter.and_then(|limiter| limiter.compute_shader_launch)),
             instruction_throughput_percent: row_metric("Instruction Throughput Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.instruction_throughput)),
             integer_complex_percent: row_metric("Integer and Complex Limiter")
-                .or_else(|| limiter.and_then(|limiter| limiter.integer_complex))
-                .map(normalize_percent_like),
+                .or_else(|| limiter.and_then(|limiter| limiter.integer_complex)),
             f32_limiter_percent: row_metric("F32 Limiter")
-                .or_else(|| limiter.and_then(|limiter| limiter.f32_limiter))
-                .map(normalize_percent_like),
+                .or_else(|| limiter.and_then(|limiter| limiter.f32_limiter)),
             l1_cache_percent: row_metric("L1 Cache Limiter")
-                .or_else(|| limiter.and_then(|limiter| limiter.l1_cache))
-                .map(normalize_percent_like),
+                .or_else(|| limiter.and_then(|limiter| limiter.l1_cache)),
             last_level_cache_percent: row_metric("Last Level Cache Limiter")
-                .or_else(|| limiter.and_then(|limiter| limiter.last_level_cache))
-                .map(normalize_percent_like),
+                .or_else(|| limiter.and_then(|limiter| limiter.last_level_cache)),
             control_flow_percent: row_metric("Control Flow Limiter")
-                .or_else(|| limiter.and_then(|limiter| limiter.control_flow))
-                .map(normalize_percent_like),
+                .or_else(|| limiter.and_then(|limiter| limiter.control_flow)),
             device_memory_bandwidth_gbps,
             gpu_read_bandwidth_gbps,
             gpu_write_bandwidth_gbps,
@@ -429,7 +415,7 @@ fn append_profiler_rows(
     sample_stats_by_name: &BTreeMap<String, (usize, f64, usize)>,
     pipeline_stats_by_name: &BTreeMap<String, profiler::ProfilerPipelineStats>,
     profiler_dispatches_by_name: &BTreeMap<String, Vec<&profiler::ProfilerDispatch>>,
-    occupancy_by_encoder: &BTreeMap<usize, (f64, f64)>,
+    occupancy_by_encoder: &BTreeMap<usize, f64>,
     represented_kernels: &BTreeSet<String>,
 ) {
     let total_dispatch_time_us = profiler_dispatches_by_name
@@ -533,9 +519,7 @@ fn append_profiler_rows(
             execution_cost_samples,
             sample_count,
             avg_sampling_density,
-            occupancy_percent: occupancy.map(|(percent, _)| percent),
-            occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
-            occupancy_manager_percent: None,
+            occupancy_percent: occupancy,
             alu_utilization_percent: None,
             shader_launch_limiter_percent: None,
             instruction_throughput_percent: None,
@@ -679,8 +663,6 @@ fn aps_counter_rows(
             sample_count: group.record_count,
             avg_sampling_density: None,
             occupancy_percent: first_metric(&metrics, &["Kernel Occupancy", "CS Occupancy"]),
-            occupancy_confidence: None,
-            occupancy_manager_percent: first_metric(&metrics, &["Occupancy Manager Target"]),
             alu_utilization_percent: first_metric(
                 &metrics,
                 &[
@@ -888,11 +870,11 @@ pub fn format_report(report: &CounterExportReport) -> String {
         report.total_rows
     ));
     out.push_str(
-        "row cb enc label kernel source duration_ns dispatches invocations exec% samples occ occ_mgr alu llc dev_bw regs spills inst\n",
+        "row cb enc label kernel source duration_ns dispatches invocations exec% samples occ alu llc dev_bw regs spills inst\n",
     );
     for row in &report.rows {
         out.push_str(&format!(
-            "{:>3} {:>2} {:>3} {:<16} {:<20} {:<14} {:>12} {:>10} {:>10} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6}\n",
+            "{:>3} {:>2} {:>3} {:<16} {:<20} {:<14} {:>12} {:>10} {:>10} {:>6} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6}\n",
             row.row_index,
             row.command_buffer_index,
             row.encoder_index,
@@ -909,9 +891,6 @@ pub fn format_report(report: &CounterExportReport) -> String {
                 .unwrap_or_else(|| "-".to_owned()),
             row.sample_count,
             row.occupancy_percent
-                .map(|value| format!("{value:.1}"))
-                .unwrap_or_else(|| "-".to_owned()),
-            row.occupancy_manager_percent
                 .map(|value| format!("{value:.1}"))
                 .unwrap_or_else(|| "-".to_owned()),
             row.alu_utilization_percent
@@ -953,7 +932,7 @@ pub fn format_report(report: &CounterExportReport) -> String {
 
 pub fn format_csv(report: &CounterExportReport) -> String {
     let mut out = String::new();
-    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_device_memory_bytes_read,buffer_device_memory_bytes_written,bytes_read_from_device_memory,bytes_written_to_device_memory,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_read_bandwidth_gbps,buffer_l1_write_accesses,buffer_l1_write_bandwidth_gbps,compute_shader_launch_utilization_percent,control_flow_utilization_percent,instruction_throughput_utilization_percent,integer_complex_utilization_percent,integer_conditional_utilization_percent,f32_utilization_percent,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
+    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_device_memory_bytes_read,buffer_device_memory_bytes_written,bytes_read_from_device_memory,bytes_written_to_device_memory,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_read_bandwidth_gbps,buffer_l1_write_accesses,buffer_l1_write_bandwidth_gbps,compute_shader_launch_utilization_percent,control_flow_utilization_percent,instruction_throughput_utilization_percent,integer_complex_utilization_percent,integer_conditional_utilization_percent,f32_utilization_percent,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
     for row in &report.rows {
         let columns = vec![
             row.row_index.to_string(),
@@ -975,8 +954,6 @@ pub fn format_csv(report: &CounterExportReport) -> String {
             row.sample_count.to_string(),
             option_csv(row.avg_sampling_density),
             option_csv(row.occupancy_percent),
-            option_csv(row.occupancy_confidence),
-            option_csv(row.occupancy_manager_percent),
             option_csv(row.alu_utilization_percent),
             option_csv(row.shader_launch_limiter_percent),
             option_csv(row.instruction_throughput_percent),
@@ -1359,10 +1336,6 @@ fn option_csv<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
-fn normalize_percent_like(value: f64) -> f64 {
-    if value <= 1.0 { value * 100.0 } else { value }
-}
-
 #[cfg(test)]
 fn normalize_for_matching(name: &str) -> String {
     name.chars()
@@ -1405,8 +1378,6 @@ mod tests {
                 sample_count: 6,
                 avg_sampling_density: Some(0.3),
                 occupancy_percent: Some(37.5),
-                occupancy_confidence: Some(0.8),
-                occupancy_manager_percent: Some(80.0),
                 alu_utilization_percent: Some(60.0),
                 shader_launch_limiter_percent: Some(12.0),
                 instruction_throughput_percent: Some(3.0),

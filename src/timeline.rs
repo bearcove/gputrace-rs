@@ -1035,7 +1035,7 @@ fn build_counter_tracks(
         && !counter_limiters.is_empty()
     {
         let mut limiter_tracks = vec![
-            CounterTrackBuilder::new("Occupancy Manager", "%"),
+            CounterTrackBuilder::new("Compute Occupancy", "%"),
             CounterTrackBuilder::new("ALU Utilization", "%"),
             CounterTrackBuilder::new("Shader Launch Limiter", "%"),
             CounterTrackBuilder::new("Instruction Throughput", "%"),
@@ -1055,32 +1055,32 @@ fn build_counter_tracks(
             };
             let start = encoder.start_time_ns;
             let end = encoder.end_time_ns.max(start);
-            if let Some(value) = limiter.occupancy_manager {
+            if let Some(value) = limiter.occupancy {
                 limiter_tracks[0].push(start, end, value);
             }
             if let Some(value) = limiter.alu_utilization {
                 limiter_tracks[1].push(start, end, value);
             }
             if let Some(value) = limiter.compute_shader_launch {
-                limiter_tracks[2].push(start, end, value * 100.0);
+                limiter_tracks[2].push(start, end, value);
             }
             if let Some(value) = limiter.instruction_throughput {
                 limiter_tracks[3].push(start, end, value);
             }
             if let Some(value) = limiter.integer_complex {
-                limiter_tracks[4].push(start, end, value * 100.0);
+                limiter_tracks[4].push(start, end, value);
             }
             if let Some(value) = limiter.f32_limiter {
-                limiter_tracks[5].push(start, end, value * 100.0);
+                limiter_tracks[5].push(start, end, value);
             }
             if let Some(value) = limiter.l1_cache {
-                limiter_tracks[6].push(start, end, value * 100.0);
+                limiter_tracks[6].push(start, end, value);
             }
             if let Some(value) = limiter.last_level_cache {
-                limiter_tracks[7].push(start, end, value * 100.0);
+                limiter_tracks[7].push(start, end, value);
             }
             if let Some(value) = limiter.control_flow {
-                limiter_tracks[8].push(start, end, value * 100.0);
+                limiter_tracks[8].push(start, end, value);
             }
             if let Some(value) = limiter.device_memory_bandwidth_gbps {
                 limiter_tracks[9].push(start, end, value);
@@ -1452,7 +1452,6 @@ mod tests {
             function_names: vec![],
             pipelines: vec![],
             execution_costs: vec![],
-            occupancies: vec![],
             dispatches,
             encoder_timings: vec![],
             timeline: Some(timeline),
@@ -1842,7 +1841,7 @@ mod tests {
         let limiters = vec![
             counter::CounterLimiter {
                 encoder_index: 0,
-                occupancy_manager: Some(80.0),
+                occupancy: Some(80.0),
                 alu_utilization: Some(62.0),
                 compute_shader_launch: Some(0.12),
                 instruction_throughput: Some(2.4),
@@ -1857,7 +1856,7 @@ mod tests {
             },
             counter::CounterLimiter {
                 encoder_index: 1,
-                occupancy_manager: Some(75.0),
+                occupancy: Some(75.0),
                 alu_utilization: Some(55.0),
                 compute_shader_launch: Some(0.10),
                 instruction_throughput: Some(2.0),
@@ -1874,7 +1873,7 @@ mod tests {
 
         let tracks = build_counter_tracks(&encoders, &[], None, Some(&limiters));
         assert!(!tracks.is_empty());
-        assert_eq!(tracks[0].name, "Occupancy Manager");
+        assert_eq!(tracks[0].name, "Compute Occupancy");
         assert_eq!(tracks[0].samples.len(), 4);
         assert_eq!(tracks[0].min_value, 75.0);
         assert_eq!(tracks[0].max_value, 80.0);
@@ -1953,7 +1952,6 @@ mod tests {
                 }),
             }],
             execution_costs: vec![],
-            occupancies: vec![],
             dispatches: vec![],
             encoder_timings: vec![],
             timeline: None,

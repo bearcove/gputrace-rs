@@ -9,7 +9,6 @@ pub mod commands;
 pub mod correlate;
 pub mod counter;
 pub mod counter_export;
-mod counter_names;
 pub mod diff;
 pub mod dump;
 pub mod error;

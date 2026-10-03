@@ -9,7 +9,6 @@ use plist::{Dictionary, Uid, Value};
 use rquickjs::{Context, Runtime};
 use serde::Serialize;
 
-use crate::counter_names::ALL_COUNTER_NAMES;
 use crate::profiler;
 use crate::trace::TraceBundle;
 use crate::xcode_counters;
@@ -24,10 +23,12 @@ struct StreamArchiveGroups {
     aps_timeline_data: Vec<Vec<u8>>,
 }
 
+/// Per-encoder hardware limiters (percent, 0..100) and bandwidths (GB/s).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CounterLimiter {
     pub encoder_index: usize,
-    pub occupancy_manager: Option<f64>,
+    /// `Compute Occupancy`.
+    pub occupancy: Option<f64>,
     pub alu_utilization: Option<f64>,
     pub compute_shader_launch: Option<f64>,
     pub instruction_throughput: Option<f64>,
@@ -39,23 +40,6 @@ pub struct CounterLimiter {
     pub device_memory_bandwidth_gbps: Option<f64>,
     pub buffer_l1_read_bandwidth_gbps: Option<f64>,
     pub buffer_l1_write_bandwidth_gbps: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct CounterFileMetric {
-    pub file_index: usize,
-    pub metric_name: String,
-    pub unit: Option<String>,
-    pub encoder_index: usize,
-    pub record_count: usize,
-    pub sample_count: usize,
-    pub aggregation: String,
-    pub total_value: f64,
-    pub representative_value: f64,
-    pub min_value: f64,
-    pub max_value: f64,
-    pub mean_value: f64,
-    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -548,12 +532,6 @@ pub struct RawCounterProbeExample {
     pub value: f64,
     pub record_tag: Option<String>,
     pub record_size: Option<usize>,
-}
-
-pub fn counter_file_metric_name(file_index: usize) -> Option<&'static str> {
-    file_index
-        .checked_sub(4)
-        .and_then(|index| ALL_COUNTER_NAMES.get(index).copied())
 }
 
 pub fn probe_raw_counters(
@@ -2435,12 +2413,25 @@ fn evaluate_agx_derived_metric_groups(
         .collect()
 }
 
+/// The JavaScript derived-counter scripts shipped in the AGX bundles exist
+/// only for G13/G14 (M1/M2). Their raw-counter hashes and formulas are
+/// generation-specific, so a script is only used for its own generation;
+/// newer GPUs go through agxps instead (`hw_counters`).
 fn choose_agx_derived_script(
     definitions_by_script: BTreeMap<PathBuf, Vec<RawCounterDerivedDefinition>>,
     device_identifier: Option<&str>,
     variables: Option<&BTreeMap<String, f64>>,
 ) -> Option<(PathBuf, Vec<RawCounterDerivedDefinition>)> {
-    definitions_by_script.into_iter().max_by(
+    let device_generation = device_identifier.and_then(agx_generation);
+    definitions_by_script
+        .into_iter()
+        .filter(|(path, _)| {
+            device_generation.is_none_or(|generation| {
+                agx_statistics_stem(path).and_then(|stem| agx_generation(&stem))
+                    == Some(generation)
+            })
+        })
+        .max_by(
         |(left_path, left_definitions), (right_path, right_definitions)| {
             agx_derived_script_score(left_path, left_definitions, device_identifier, variables)
                 .cmp(&agx_derived_script_score(
@@ -2476,7 +2467,7 @@ fn agx_derived_script_score(
     let direct_match = device_identifier
         .filter(|identifier| stem.contains(identifier) || identifier.contains(&stem))
         .is_some() as u8;
-    let compatibility = agx_derived_script_compatibility_rank(&stem, device_identifier);
+    let compatibility = agx_derived_script_compatibility_rank(&stem);
     (
         raw_hash_overlap,
         direct_match,
@@ -2485,16 +2476,25 @@ fn agx_derived_script_score(
     )
 }
 
-fn agx_derived_script_compatibility_rank(stem: &str, device_identifier: Option<&str>) -> u8 {
-    if matches!(device_identifier, Some(identifier) if identifier.contains("G16X")) {
-        return match () {
-            _ if stem.contains("G14D") => 80,
-            _ if stem.contains("G14C") => 70,
-            _ if stem.contains("G14S") => 60,
-            _ if stem.contains("G14G") => 50,
-            _ => 0,
-        };
+/// GPU generation named by a device identifier (`G16X` -> 16) or a derived
+/// script stem (`AGXMetalStatisticsExternalG14S` -> 14; the `A14X` and
+/// `13_3` scripts ship in the G13 bundles).
+fn agx_generation(identifier: &str) -> Option<u32> {
+    if identifier.contains("A14X") || identifier.contains("13_3") {
+        return Some(13);
     }
+    let bytes = identifier.as_bytes();
+    (0..bytes.len().saturating_sub(2))
+        .rev()
+        .find(|&index| {
+            bytes[index] == b'G'
+                && bytes[index + 1].is_ascii_digit()
+                && bytes[index + 2].is_ascii_digit()
+        })
+        .and_then(|index| identifier[index + 1..index + 3].parse().ok())
+}
+
+fn agx_derived_script_compatibility_rank(stem: &str) -> u8 {
     match () {
         _ if stem.contains("G14D") => 40,
         _ if stem.contains("G14C") => 35,
@@ -2511,17 +2511,15 @@ fn trace_agx_device_identifier(trace_path: &Path) -> Option<String> {
     let stream_data = profiler_directory.join("streamData");
     let data = fs::read(stream_data).ok()?;
     let text = String::from_utf8_lossy(&data);
-    for marker in [
-        "AGXMetalG16X",
-        "AGXMetalG16G",
-        "AGXMetalG14X",
-        "AGXMetalG14G",
-    ] {
-        if text.contains(marker) {
-            return Some(marker.trim_start_matches("AGXMetal").to_owned());
-        }
-    }
-    None
+    // Driver bundle names such as `AGXMetalG16G_B0`: keep the `G16G` part.
+    text.match_indices("AGXMetal").find_map(|(index, _)| {
+        let identifier = text[index + "AGXMetal".len()..]
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        (identifier.starts_with('G') && agx_generation(&identifier).is_some())
+            .then_some(identifier)
+    })
 }
 
 fn evaluate_agx_derived_script(
@@ -5705,179 +5703,40 @@ fn as_u64(value: &Value) -> Option<u64> {
     }
 }
 
-pub fn extract_counter_file_metrics(profiler_dir: &Path) -> Vec<CounterFileMetric> {
-    let Ok(entries) = fs::read_dir(profiler_dir) else {
-        return Vec::new();
-    };
-
-    let mut files = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let file_index = name
-                .strip_prefix("Counters_f_")
-                .and_then(|rest| rest.strip_suffix(".raw"))
-                .and_then(|rest| rest.parse::<usize>().ok())?;
-            path.is_file().then_some((file_index, path))
-        })
-        .collect::<Vec<_>>();
-    files.sort_by_key(|(file_index, _)| *file_index);
-
-    let mut metrics = Vec::new();
-    for (file_index, path) in files {
-        let Ok(data) = fs::read(path) else {
-            continue;
-        };
-        metrics.extend(extract_counter_file_metrics_from_data(file_index, &data));
-    }
-    metrics.sort_by(|left, right| {
-        left.encoder_index
-            .cmp(&right.encoder_index)
-            .then_with(|| left.file_index.cmp(&right.file_index))
-    });
-    metrics
-}
-
+/// Per-encoder limiters and utilizations of the limiter pass (see
+/// [`crate::hw_counters`]): percentages in 0..100, bandwidths in GB/s.
 pub fn extract_limiters(profiler_dir: &Path) -> Vec<CounterLimiter> {
-    let Ok(entries) = fs::read_dir(profiler_dir) else {
-        return Vec::new();
-    };
-
-    let mut encoder_limiters = BTreeMap::<usize, CounterLimiter>::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !path.is_file() || !name.starts_with("Counters_f_") || !name.ends_with(".raw") {
-            continue;
-        }
-        let Ok(data) = fs::read(path) else {
-            continue;
-        };
-        let record_starts = find_record_starts(&data);
-        if record_starts.is_empty() {
-            continue;
-        }
-
-        let mut current_encoder = None;
-        for (index, offset) in record_starts.iter().enumerate() {
-            let next = record_starts.get(index + 1).copied().unwrap_or(data.len());
-            let record_size = next.saturating_sub(*offset);
-            if (2300..=2900).contains(&record_size) {
-                let encoder_index = current_encoder.map(|value| value + 1).unwrap_or(0);
-                current_encoder = Some(encoder_index);
-                encoder_limiters
-                    .entry(encoder_index)
-                    .or_insert_with(|| CounterLimiter {
-                        encoder_index,
-                        occupancy_manager: None,
-                        alu_utilization: None,
-                        compute_shader_launch: None,
-                        instruction_throughput: None,
-                        integer_complex: None,
-                        control_flow: None,
-                        f32_limiter: None,
-                        l1_cache: None,
-                        last_level_cache: None,
-                        device_memory_bandwidth_gbps: None,
-                        buffer_l1_read_bandwidth_gbps: None,
-                        buffer_l1_write_bandwidth_gbps: None,
-                    });
-                continue;
-            }
-            if record_size != 464 {
-                continue;
-            }
-            let Some(encoder_index) = current_encoder else {
-                continue;
-            };
-            let Some(record) = data.get(*offset..(*offset + record_size)) else {
-                continue;
-            };
-            let limiter = encoder_limiters
-                .entry(encoder_index)
-                .or_insert_with(|| CounterLimiter {
-                    encoder_index,
-                    occupancy_manager: None,
-                    alu_utilization: None,
-                    compute_shader_launch: None,
-                    instruction_throughput: None,
-                    integer_complex: None,
-                    control_flow: None,
-                    f32_limiter: None,
-                    l1_cache: None,
-                    last_level_cache: None,
-                    device_memory_bandwidth_gbps: None,
-                    buffer_l1_read_bandwidth_gbps: None,
-                    buffer_l1_write_bandwidth_gbps: None,
-                });
-            classify_record_metrics(record, limiter);
-        }
-    }
-
-    encoder_limiters.into_values().collect()
+    crate::hw_counters::cached_report(profiler_dir)
+        .map(|report| {
+            report
+                .encoders
+                .iter()
+                .filter_map(|row| {
+                    Some(CounterLimiter {
+                        encoder_index: row.encoder_index?,
+                        occupancy: row.percent("Compute Occupancy"),
+                        alu_utilization: row.percent("ALU Utilization"),
+                        compute_shader_launch: row.percent("Compute Shader Launch Limiter"),
+                        instruction_throughput: row.percent("Instruction Issue Limiter"),
+                        integer_complex: row.percent("IC Limiter"),
+                        control_flow: row.percent("Control Flow Limiter"),
+                        f32_limiter: row.percent("F32 Limiter"),
+                        l1_cache: row.percent("L1 Cache Limiter"),
+                        last_level_cache: row.percent("L2 Cache Limiter"),
+                        device_memory_bandwidth_gbps: row.dram_gbps(),
+                        buffer_l1_read_bandwidth_gbps: row.gbps("Buffer L1 Load Bandwidth"),
+                        buffer_l1_write_bandwidth_gbps: row.gbps("Buffer L1 Store Bandwidth"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn extract_limiters_for_trace(path: &Path) -> Vec<CounterLimiter> {
     profiler::find_profiler_directory(path)
         .map(|dir| extract_limiters(&dir))
         .unwrap_or_default()
-}
-
-fn extract_counter_file_metrics_from_data(
-    file_index: usize,
-    data: &[u8],
-) -> Vec<CounterFileMetric> {
-    let record_starts = find_record_starts(data);
-    if record_starts.is_empty() {
-        return Vec::new();
-    }
-
-    let metric_name = counter_file_metric_name(file_index)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("Counters_f_{file_index}"));
-    let unit = counter_metric_unit(&metric_name).map(ToOwned::to_owned);
-    let mut current_encoder = None;
-    let mut by_encoder = BTreeMap::<usize, (usize, Vec<f64>)>::new();
-
-    for (index, offset) in record_starts.iter().enumerate() {
-        let next = record_starts.get(index + 1).copied().unwrap_or(data.len());
-        let record_size = next.saturating_sub(*offset);
-        if (2300..=2900).contains(&record_size) {
-            let encoder_index = current_encoder.map(|value| value + 1).unwrap_or(0);
-            current_encoder = Some(encoder_index);
-            by_encoder.entry(encoder_index).or_default();
-            continue;
-        }
-        if record_size != 464 {
-            continue;
-        }
-        let encoder_index = current_encoder.unwrap_or(0);
-        let Some(record) = data.get(*offset..(*offset + record_size)) else {
-            continue;
-        };
-        let values = extract_counter_record_values(record, &metric_name);
-        if values.is_empty() {
-            continue;
-        }
-        let (record_count, samples) = by_encoder.entry(encoder_index).or_default();
-        *record_count += 1;
-        samples.extend(values);
-    }
-
-    by_encoder
-        .into_iter()
-        .filter_map(|(encoder_index, (record_count, values))| {
-            summarize_counter_values(
-                file_index,
-                metric_name.clone(),
-                unit.clone(),
-                encoder_index,
-                record_count,
-                values,
-            )
-        })
-        .collect()
 }
 
 fn is_probe_metric(metric: &str) -> bool {
@@ -6079,281 +5938,6 @@ fn marker_for_offset(data: &[u8], markers: &[usize], offset: usize) -> Option<(u
     (next > start).then_some((data[start], next - start))
 }
 
-fn summarize_counter_values(
-    file_index: usize,
-    metric_name: String,
-    unit: Option<String>,
-    encoder_index: usize,
-    record_count: usize,
-    mut values: Vec<f64>,
-) -> Option<CounterFileMetric> {
-    values.retain(|value| value.is_finite());
-    if values.is_empty() {
-        return None;
-    }
-
-    values.sort_by(|left, right| left.total_cmp(right));
-    let sample_count = values.len();
-    let min_value = values[0];
-    let max_value = values[sample_count - 1];
-    let total_value = values.iter().sum::<f64>();
-    let mean_value = total_value / sample_count as f64;
-    let aggregation = counter_metric_aggregation(unit.as_deref()).to_owned();
-    let representative_value = if aggregation == "sum" {
-        total_value
-    } else {
-        median_sorted(&values)
-    };
-    let confidence = counter_metric_confidence(record_count, sample_count, min_value, max_value);
-
-    Some(CounterFileMetric {
-        file_index,
-        metric_name,
-        unit,
-        encoder_index,
-        record_count,
-        sample_count,
-        aggregation,
-        total_value,
-        representative_value,
-        min_value,
-        max_value,
-        mean_value,
-        confidence,
-    })
-}
-
-fn extract_counter_record_values(record: &[u8], metric_name: &str) -> Vec<f64> {
-    if counter_metric_unit(metric_name) == Some("bytes") {
-        return extract_byte_count_candidates(record)
-            .into_iter()
-            .map(|value| value as f64)
-            .collect();
-    }
-
-    let mut values = Vec::new();
-    let mut seen = Vec::<u32>::new();
-    let max = counter_metric_max_value(metric_name);
-    for chunk in record[4..].chunks_exact(mem::size_of::<u32>()) {
-        let bits = u32::from_le_bytes(chunk.try_into().unwrap());
-        let value = f32::from_bits(bits) as f64;
-        if value.is_finite() && value >= 0.000_001 && value <= max && !seen.contains(&bits) {
-            seen.push(bits);
-            values.push(value);
-        }
-    }
-    values
-}
-
-fn extract_byte_count_candidates(data: &[u8]) -> Vec<u64> {
-    const MIN_BYTES: u64 = 1_000;
-    const MAX_BYTES: u64 = 100_000_000;
-
-    let mut values = Vec::new();
-    let mut seen = Vec::<u64>::new();
-    for start in [0usize, 4] {
-        let mut offset = start;
-        while offset + mem::size_of::<u64>() <= data.len() {
-            let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-            if (MIN_BYTES..=MAX_BYTES).contains(&value) && !seen.contains(&value) {
-                seen.push(value);
-                values.push(value);
-            }
-            offset += mem::size_of::<u64>();
-        }
-    }
-    values
-}
-
-fn counter_metric_unit(metric_name: &str) -> Option<&'static str> {
-    if metric_name.contains("Bandwidth") {
-        Some("GB/s")
-    } else if metric_name.contains("Utilization")
-        || metric_name.contains("Limiter")
-        || metric_name.contains("Occupancy")
-        || metric_name.contains("Miss Rate")
-        || metric_name.contains("Inefficiency")
-        || metric_name.contains("Residency")
-        || metric_name.contains("Compression Ratio")
-        || metric_name.contains("Average")
-    {
-        Some("%")
-    } else if metric_name.contains("Bytes") {
-        Some("bytes")
-    } else if metric_name.contains("Instructions")
-        || metric_name.contains("Invocations")
-        || metric_name.contains("Accesses")
-        || metric_name.contains("Calls")
-        || metric_name.contains("Pixels")
-        || metric_name.contains("Primitives")
-        || metric_name.contains("Samples")
-        || metric_name.contains("Vertices")
-        || metric_name.contains("Triangles")
-    {
-        Some("count")
-    } else {
-        None
-    }
-}
-
-fn counter_metric_aggregation(unit: Option<&str>) -> &'static str {
-    if unit == Some("bytes") {
-        "sum"
-    } else {
-        "average"
-    }
-}
-
-fn counter_metric_max_value(metric_name: &str) -> f64 {
-    match counter_metric_unit(metric_name) {
-        Some("%") => 10_000.0,
-        Some("GB/s") => 10_000.0,
-        Some("bytes") => 1.0e18,
-        Some("count") => 1.0e15,
-        _ => 1.0e12,
-    }
-}
-
-fn median_sorted(values: &[f64]) -> f64 {
-    let mid = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        (values[mid - 1] + values[mid]) / 2.0
-    } else {
-        values[mid]
-    }
-}
-
-fn counter_metric_confidence(
-    record_count: usize,
-    sample_count: usize,
-    min_value: f64,
-    max_value: f64,
-) -> f64 {
-    let record_confidence = (record_count as f64 / 4.0).min(1.0);
-    let sample_confidence = (sample_count as f64 / 12.0).min(1.0);
-    let spread_confidence = if max_value <= f64::EPSILON {
-        0.0
-    } else {
-        1.0 - ((max_value - min_value).abs() / max_value).min(1.0)
-    };
-    (0.45 * record_confidence + 0.35 * sample_confidence + 0.20 * spread_confidence).min(1.0)
-}
-
-fn classify_record_metrics(record: &[u8], limiter: &mut CounterLimiter) {
-    let percent_values = extract_float_values(record, 0.001, 100.0, 64);
-    let bandwidth_values = extract_float_values(record, 0.1, 20.0, 24);
-
-    let mut high_values = percent_values
-        .iter()
-        .copied()
-        .filter(|value| (10.0..=100.0).contains(value))
-        .collect::<Vec<_>>();
-    high_values.sort_by(|left, right| right.partial_cmp(left).unwrap());
-    for value in high_values {
-        if limiter.occupancy_manager.is_none() && value >= 50.0 {
-            limiter.occupancy_manager = Some(value);
-            continue;
-        }
-        if limiter.alu_utilization.is_none() {
-            limiter.alu_utilization = Some(value);
-        }
-    }
-
-    let mut tiny_values = percent_values
-        .iter()
-        .copied()
-        .filter(|value| (0.001..=0.25).contains(value))
-        .collect::<Vec<_>>();
-    tiny_values.sort_by(|left, right| right.partial_cmp(left).unwrap());
-    for value in tiny_values {
-        if limiter.compute_shader_launch.is_none() {
-            limiter.compute_shader_launch = Some(value);
-            continue;
-        }
-        if limiter.l1_cache.is_none() {
-            limiter.l1_cache = Some(value);
-            continue;
-        }
-        if limiter.last_level_cache.is_none() {
-            limiter.last_level_cache = Some(value);
-            continue;
-        }
-        if limiter.control_flow.is_none() {
-            limiter.control_flow = Some(value);
-        }
-    }
-
-    let mut medium_values = percent_values
-        .iter()
-        .copied()
-        .filter(|value| (0.25..=10.0).contains(value))
-        .collect::<Vec<_>>();
-    medium_values.sort_by(|left, right| right.partial_cmp(left).unwrap());
-    for value in medium_values {
-        if limiter.f32_limiter.is_none() && value >= 4.0 {
-            limiter.f32_limiter = Some(value);
-            continue;
-        }
-        if limiter.integer_complex.is_none() && value >= 1.0 {
-            limiter.integer_complex = Some(value);
-            continue;
-        }
-        if limiter.instruction_throughput.is_none() {
-            limiter.instruction_throughput = Some(value);
-            continue;
-        }
-        if limiter.control_flow.is_none() {
-            limiter.control_flow = Some(value);
-        }
-    }
-
-    let mut bandwidth_candidates = bandwidth_values
-        .into_iter()
-        .filter(|value| value.is_finite() && *value >= 0.1)
-        .collect::<Vec<_>>();
-    bandwidth_candidates.sort_by(|left, right| right.partial_cmp(left).unwrap());
-    for value in bandwidth_candidates {
-        if limiter.device_memory_bandwidth_gbps.is_none() && value >= 1.0 {
-            limiter.device_memory_bandwidth_gbps = Some(value);
-            continue;
-        }
-        if limiter.buffer_l1_read_bandwidth_gbps.is_none() {
-            limiter.buffer_l1_read_bandwidth_gbps = Some(value);
-            continue;
-        }
-        if limiter.buffer_l1_write_bandwidth_gbps.is_none() {
-            limiter.buffer_l1_write_bandwidth_gbps = Some(value);
-        }
-    }
-}
-
-fn find_record_starts(data: &[u8]) -> Vec<usize> {
-    let mut starts = Vec::new();
-    for i in 0..data.len().saturating_sub(mem::size_of::<u32>()) {
-        if data[i..].starts_with(&[0x4e, 0x00, 0x00, 0x00]) {
-            starts.push(i);
-        }
-    }
-    starts
-}
-
-fn extract_float_values(data: &[u8], min: f64, max: f64, max_count: usize) -> Vec<f64> {
-    let mut values = Vec::new();
-    let mut seen = Vec::<u32>::new();
-    for chunk in data.chunks_exact(mem::size_of::<u32>()) {
-        if values.len() >= max_count {
-            break;
-        }
-        let bits = u32::from_le_bytes(chunk.try_into().unwrap());
-        let value = f32::from_bits(bits) as f64;
-        if value.is_finite() && value >= min && value <= max && !seen.contains(&bits) {
-            seen.push(bits);
-            values.push(value);
-        }
-    }
-    values
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6362,26 +5946,6 @@ mod tests {
 
     fn test_integer(value: u64) -> Value {
         Value::Integer(Integer::from(value))
-    }
-
-    fn sample_record(values: &[f32]) -> Vec<u8> {
-        let mut record = vec![0u8; 464];
-        record[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
-        for (index, value) in values.iter().enumerate() {
-            let offset = 4 + index * 4;
-            record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        record
-    }
-
-    fn byte_sample_record(values: &[u64]) -> Vec<u8> {
-        let mut record = vec![0u8; 464];
-        record[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
-        for (index, value) in values.iter().enumerate() {
-            let offset = 8 + index * 8;
-            record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        record
     }
 
     fn gprw_blob(timestamps: &[u64]) -> Vec<u8> {
@@ -6762,7 +6326,7 @@ mod tests {
     }
 
     #[test]
-    fn chooses_single_g16_compatible_agx_derived_script() {
+    fn derived_scripts_only_apply_to_their_gpu_generation() {
         let definitions_by_script = BTreeMap::from([
             (
                 PathBuf::from("AGXMetalStatisticsExternalG14S-derived.js"),
@@ -6800,9 +6364,11 @@ mod tests {
             ),
         ]);
 
+        assert!(
+            choose_agx_derived_script(definitions_by_script.clone(), Some("G16X"), None).is_none()
+        );
         let (path, _) =
-            choose_agx_derived_script(definitions_by_script, Some("G16X"), None).unwrap();
-
+            choose_agx_derived_script(definitions_by_script, Some("G14X"), None).unwrap();
         assert_eq!(
             path,
             PathBuf::from("AGXMetalStatisticsExternalG14D-derived.js")
@@ -6850,104 +6416,13 @@ mod tests {
         let variables = BTreeMap::from([("_present_norm".to_owned(), 1.0)]);
 
         let (path, _) =
-            choose_agx_derived_script(definitions_by_script, Some("G16X"), Some(&variables))
+            choose_agx_derived_script(definitions_by_script, Some("G14X"), Some(&variables))
                 .unwrap();
 
         assert_eq!(
             path,
             PathBuf::from("AGXMetalStatisticsExternalG14G-derived.js")
         );
-    }
-
-    #[test]
-    fn extracts_limiters_from_counter_file() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("Counters_f_33.raw");
-
-        let mut data = vec![0u8; 2400];
-        data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
-        data.extend_from_slice(&sample_record(&[
-            72.0, 58.0, 0.18, 0.12, 0.09, 0.04, 6.5, 2.4, 1.2, 8.2, 2.3, 0.7,
-        ]));
-        fs::write(&path, data).unwrap();
-
-        let limiters = extract_limiters(dir.path());
-        assert_eq!(limiters.len(), 1);
-        assert_eq!(limiters[0].encoder_index, 0);
-        assert_eq!(limiters[0].occupancy_manager, Some(72.0));
-        assert_eq!(limiters[0].alu_utilization, Some(58.0));
-        assert!((limiters[0].compute_shader_launch.unwrap() - 0.18).abs() < 0.001);
-        assert!((limiters[0].l1_cache.unwrap() - 0.12).abs() < 0.001);
-        assert!((limiters[0].last_level_cache.unwrap() - 0.09).abs() < 0.001);
-        assert!((limiters[0].control_flow.unwrap() - 0.04).abs() < 0.001);
-        assert!((limiters[0].f32_limiter.unwrap() - 8.2).abs() < 0.001);
-        assert!((limiters[0].integer_complex.unwrap() - 6.5).abs() < 0.001);
-        assert!((limiters[0].instruction_throughput.unwrap() - 2.4).abs() < 0.001);
-        assert!((limiters[0].device_memory_bandwidth_gbps.unwrap() - 8.2).abs() < 0.001);
-        assert!((limiters[0].buffer_l1_read_bandwidth_gbps.unwrap() - 6.5).abs() < 0.001);
-        assert!((limiters[0].buffer_l1_write_bandwidth_gbps.unwrap() - 2.4).abs() < 0.001);
-    }
-
-    #[test]
-    fn maps_counter_file_indices_using_go_csv_order() {
-        assert_eq!(counter_file_metric_name(3), None);
-        assert_eq!(counter_file_metric_name(12), Some("ALU Utilization"));
-        assert_eq!(
-            counter_file_metric_name(33),
-            Some("Compute Shader Launch Limiter")
-        );
-        assert_eq!(counter_file_metric_name(107), Some("Kernel Occupancy"));
-    }
-
-    #[test]
-    fn extracts_named_counter_file_metrics() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("Counters_f_12.raw");
-
-        let mut data = vec![0u8; 2400];
-        data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
-        data.extend_from_slice(&sample_record(&[12.0, 16.0, 20.0]));
-        data.extend_from_slice(&sample_record(&[14.0, 18.0, 22.0]));
-        fs::write(&path, data).unwrap();
-
-        let metrics = extract_counter_file_metrics(dir.path());
-        assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].file_index, 12);
-        assert_eq!(metrics[0].metric_name, "ALU Utilization");
-        assert_eq!(metrics[0].unit.as_deref(), Some("%"));
-        assert_eq!(metrics[0].encoder_index, 0);
-        assert_eq!(metrics[0].record_count, 2);
-        assert_eq!(metrics[0].sample_count, 6);
-        assert_eq!(metrics[0].aggregation, "average");
-        assert_eq!(metrics[0].total_value, 102.0);
-        assert_eq!(metrics[0].representative_value, 17.0);
-        assert_eq!(metrics[0].min_value, 12.0);
-        assert_eq!(metrics[0].max_value, 22.0);
-        assert_eq!(metrics[0].mean_value, 17.0);
-        assert!(metrics[0].confidence > 0.5);
-    }
-
-    #[test]
-    fn sums_byte_counter_file_metrics_like_go() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("Counters_f_28.raw");
-
-        let mut data = vec![0u8; 2400];
-        data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
-        data.extend_from_slice(&byte_sample_record(&[4096, 8192]));
-        data.extend_from_slice(&byte_sample_record(&[16384]));
-        fs::write(&path, data).unwrap();
-
-        let metrics = extract_counter_file_metrics(dir.path());
-        assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].file_index, 28);
-        assert_eq!(metrics[0].metric_name, "Bytes Read From Device Memory");
-        assert_eq!(metrics[0].unit.as_deref(), Some("bytes"));
-        assert_eq!(metrics[0].aggregation, "sum");
-        assert_eq!(metrics[0].sample_count, 3);
-        assert_eq!(metrics[0].total_value, 28_672.0);
-        assert_eq!(metrics[0].representative_value, 28_672.0);
-        assert!((metrics[0].mean_value - 9557.333).abs() < 0.01);
     }
 
     #[test]

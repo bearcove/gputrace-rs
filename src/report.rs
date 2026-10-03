@@ -7,7 +7,7 @@ use crate::apicalls;
 use crate::buffers;
 use crate::commands;
 use crate::counter;
-use crate::counter_export;
+use crate::hw_counters;
 use crate::error::Result;
 use crate::insights;
 use crate::markdown;
@@ -89,9 +89,9 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
     let raw_probe = counter::probe_raw_counters(&trace, None, None, false).ok();
     writer.record_timing("shared raw counter probe", raw_probe_start);
 
-    let limiters_start = writer.start_section("shared counter limiters");
-    let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
-    writer.record_timing("shared counter limiters", limiters_start);
+    let hw_start = writer.start_section("shared hardware counters");
+    let hw_counter_report = hw_counters::cached_report_result(&trace.path);
+    writer.record_timing("shared hardware counters", hw_start);
 
     let mut xcode_mio_summary = None;
     let xcode_start = writer.start_section("xcode mio");
@@ -154,7 +154,7 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         raw_counters
             .as_ref()
             .and_then(|report| report.profiling_address_summary.as_ref()),
-        Some(&limiter_metrics),
+        hw_counter_report.as_deref().ok(),
     ) {
         Ok(report) => {
             writer.write_section(
@@ -234,14 +234,22 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
             raw_counters_format_start,
         )?;
     }
-    writer.write_result("counters.md", "Counters", "counters", || {
-        counter_export::report_with_context(
-            &trace,
-            profiler_summary.as_ref(),
-            raw_counters.as_ref(),
-        )
-        .map(|report| counter_export::format_report(&report))
-    })?;
+    let counters_start = writer.start_section("counters");
+    match &hw_counter_report {
+        Ok(report) => writer.write_markdown(
+            "counters.md",
+            hw_counters::format_markdown(report),
+            "counters",
+            counters_start,
+        )?,
+        Err(error) => writer.write_failure(
+            "counters.md",
+            "counters",
+            "Counters",
+            &format!("no limiter-pass hardware counters: {error}"),
+            counters_start,
+        )?,
+    }
     writer.write_optional_result("buffers.md", "Buffers", "buffers", || {
         buffers::analyze(&trace).map(|report| buffers::markdown_report(&report))
     })?;
@@ -276,6 +284,7 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         &analysis,
         xcode_mio_summary.as_ref(),
         raw_counters.as_ref(),
+        hw_counter_report.as_deref().ok(),
         total_ms,
     )?;
 
@@ -416,6 +425,7 @@ impl ReportWriter {
         analysis: &analysis::AnalysisReport,
         xcode_mio: Option<&xcode_mio::XcodeMioAnalysisReport>,
         raw_counters: Option<&counter::RawCountersReport>,
+        hw_counters: Option<&hw_counters::HwCounterReport>,
         total_ms: f64,
     ) -> Result<()> {
         let mut out = String::new();
@@ -443,6 +453,22 @@ impl ReportWriter {
             out.push_str(&format!(
                 "- Dispatches: `{}`\n- Kernels: `{}`\n",
                 analysis.dispatch_count, analysis.kernel_count,
+            ));
+        }
+        if let Some(report) = hw_counters {
+            out.push_str(&format!(
+                "- Hardware counters ([counters](counters.md)): `{}`, `{}` encoders, `{}` dispatches attributed{}\n",
+                report.gpu.gpu_type,
+                report.encoders.len(),
+                report.dispatches.len(),
+                if report.foreign_kicks > 0 {
+                    format!(
+                        ", `{}` kicks from other processes during the counter pass",
+                        report.foreign_kicks
+                    )
+                } else {
+                    String::new()
+                },
             ));
         }
         out.push_str(&format!(

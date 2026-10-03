@@ -23,7 +23,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::keyed_archive::{self, ArchiveValue};
@@ -33,38 +34,174 @@ use crate::trace::TraceBundle;
 /// Counters surfaced in reports, in display order. Names are agxps derived
 /// counter names; values are converted with [`MetricUnit`].
 pub const METRICS: &[MetricSpec] = &[
-    MetricSpec::new("ALU Utilization", "alu", MetricUnit::Percent),
-    MetricSpec::new("F32 Utilization", "f32", MetricUnit::Percent),
-    MetricSpec::new("F16 Utilization", "f16", MetricUnit::Percent),
-    MetricSpec::new("Instruction Issue Limiter", "issue_lim", MetricUnit::Percent),
-    MetricSpec::new("Shader Core Limiter", "core_lim", MetricUnit::Percent),
-    MetricSpec::new("Compute Occupancy", "occ", MetricUnit::Percent),
-    MetricSpec::new("Compute Shader Launch Limiter", "launch_lim", MetricUnit::Percent),
-    MetricSpec::new("L1 Cache Limiter", "l1_lim", MetricUnit::Percent),
-    MetricSpec::new("Buffer L1 Miss Rate", "l1_miss", MetricUnit::Percent),
-    MetricSpec::new("L2 Cache Limiter", "l2_lim", MetricUnit::Percent),
-    MetricSpec::new("MMU Limiter", "mmu_lim", MetricUnit::Percent),
-    MetricSpec::new("AF Read Bandwidth", "dram_rd", MetricUnit::GigabytesPerSecond),
-    MetricSpec::new("AF Write Bandwidth", "dram_wr", MetricUnit::GigabytesPerSecond),
-    MetricSpec::new("BytesReadFromMainMemory", "dram_rd_bytes", MetricUnit::Bytes),
-    MetricSpec::new("BytesWrittenToMainMemory", "dram_wr_bytes", MetricUnit::Bytes),
-    MetricSpec::new("L2 Bandwidth", "l2_bw", MetricUnit::GigabytesPerSecond),
-    MetricSpec::new("Buffer L1 Load Bandwidth", "l1_ld_bw", MetricUnit::GigabytesPerSecond),
-    MetricSpec::new("Buffer L1 Store Bandwidth", "l1_st_bw", MetricUnit::GigabytesPerSecond),
+    MetricSpec::new(
+        "ALU Utilization",
+        "alu",
+        MetricUnit::Percent,
+        "busy fraction of the ALU pipes, all data types",
+        "semantics unclear: 55% on a pure F32 FMA kernel whose F32 Utilization is 88%",
+    ),
+    MetricSpec::new(
+        "F32 Utilization",
+        "f32",
+        MetricUnit::Percent,
+        "busy fraction of the F32 pipe",
+        "plausible: 88% on the pure FMA oracle",
+    ),
+    MetricSpec::new(
+        "F16 Utilization",
+        "f16",
+        MetricUnit::Percent,
+        "busy fraction of the F16 pipe",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Instruction Issue Limiter",
+        "issue_lim",
+        MetricUnit::Percent,
+        "instruction issue busy fraction",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Shader Core Limiter",
+        "core_lim",
+        MetricUnit::Percent,
+        "highest of the shader-core limiters",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Compute Occupancy",
+        "occ",
+        MetricUnit::Percent,
+        "resident compute SIMD groups / maximum",
+        "checked: ~2% on the one-SIMD-group-per-core oracle, high on the full-grid oracles",
+    ),
+    MetricSpec::new(
+        "Compute Shader Launch Limiter",
+        "launch_lim",
+        MetricUnit::Percent,
+        "compute launch busy fraction",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "L1 Cache Limiter",
+        "l1_lim",
+        MetricUnit::Percent,
+        "L1 busy fraction",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Buffer L1 Miss Rate",
+        "l1_miss",
+        MetricUnit::Percent,
+        "buffer L1 misses / accesses",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "L2 Cache Limiter",
+        "l2_lim",
+        MetricUnit::Percent,
+        "L2 (last-level GPU cache) busy fraction",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "MMU Limiter",
+        "mmu_lim",
+        MetricUnit::Percent,
+        "address translation busy fraction",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "AF Read Bandwidth",
+        "dram_rd",
+        MetricUnit::GigabytesPerSecond,
+        "DRAM (Apple fabric) read bandwidth",
+        "exact: copy/read oracles read their 64 MiB",
+    ),
+    MetricSpec::new(
+        "AF Write Bandwidth",
+        "dram_wr",
+        MetricUnit::GigabytesPerSecond,
+        "DRAM (Apple fabric) write bandwidth",
+        "exact: copy oracle writes its 64 MiB",
+    ),
+    MetricSpec::new(
+        "BytesReadFromMainMemory",
+        "dram_rd_bytes",
+        MetricUnit::Bytes,
+        "bytes read from DRAM",
+        "exact (as dram_rd)",
+    ),
+    MetricSpec::new(
+        "BytesWrittenToMainMemory",
+        "dram_wr_bytes",
+        MetricUnit::Bytes,
+        "bytes written to DRAM",
+        "exact (as dram_wr)",
+    ),
+    MetricSpec::new(
+        "L2 Bandwidth",
+        "l2_bw",
+        MetricUnit::GigabytesPerSecond,
+        "L2 bandwidth",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Buffer L1 Load Bandwidth",
+        "l1_ld_bw",
+        MetricUnit::GigabytesPerSecond,
+        "buffer loads through L1",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Buffer L1 Store Bandwidth",
+        "l1_st_bw",
+        MetricUnit::GigabytesPerSecond,
+        "buffer stores through L1",
+        "not oracle-checked",
+    ),
     MetricSpec::new(
         "Threadgroup Memory L1 Load Bandwidth",
         "tg_ld_bw",
         MetricUnit::GigabytesPerSecond,
+        "threadgroup-memory loads",
+        "scale off: 0.68x the bytes the threadgroup oracle loads",
     ),
     MetricSpec::new(
         "Threadgroup Memory L1 Store Bandwidth",
         "tg_st_bw",
         MetricUnit::GigabytesPerSecond,
+        "threadgroup-memory stores",
+        "not oracle-checked",
     ),
-    MetricSpec::new("Compute Threads Launched", "threads", MetricUnit::Count),
-    MetricSpec::new("ALU F32 Instructions", "f32_inst", MetricUnit::Count),
-    MetricSpec::new("ALU F16 Instructions", "f16_inst", MetricUnit::Count),
-    MetricSpec::new("Instructions Executed", "inst", MetricUnit::Count),
+    MetricSpec::new(
+        "Compute Threads Launched",
+        "threads",
+        MetricUnit::Count,
+        "threads launched",
+        "exact, except the first encoder of a replay (92-98% on M4)",
+    ),
+    MetricSpec::new(
+        "ALU F32 Instructions",
+        "f32_inst",
+        MetricUnit::Count,
+        "F32 ALU instructions executed (SIMD-group instructions x active threads / 32)",
+        "exact on the FMA oracle",
+    ),
+    MetricSpec::new(
+        "ALU F16 Instructions",
+        "f16_inst",
+        MetricUnit::Count,
+        "F16 ALU instructions executed",
+        "not oracle-checked",
+    ),
+    MetricSpec::new(
+        "Instructions Executed",
+        "inst",
+        MetricUnit::Count,
+        "all instructions executed",
+        "not oracle-checked",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -74,11 +211,27 @@ pub struct MetricSpec {
     /// Short column label.
     pub label: &'static str,
     pub unit: MetricUnit,
+    pub meaning: &'static str,
+    /// What the synthetic oracle kernels (`synth-bench --counter-oracle`)
+    /// established about this counter.
+    pub oracle: &'static str,
 }
 
 impl MetricSpec {
-    const fn new(name: &'static str, label: &'static str, unit: MetricUnit) -> Self {
-        Self { name, label, unit }
+    const fn new(
+        name: &'static str,
+        label: &'static str,
+        unit: MetricUnit,
+        meaning: &'static str,
+        oracle: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            label,
+            unit,
+            meaning,
+            oracle,
+        }
     }
 }
 
@@ -162,12 +315,66 @@ impl HwCounterRow {
             .map(|value| spec.unit.display_value(value))
     }
 
-    pub fn metric_named(&self, name: &str) -> Option<f64> {
-        METRICS
-            .iter()
-            .find(|spec| spec.name == name)
-            .and_then(|spec| self.metric(spec))
+    /// A 0..1 agxps counter as a percentage.
+    pub fn percent(&self, name: &str) -> Option<f64> {
+        self.raw_value(name)
+            .map(|value| MetricUnit::Percent.display_value(value))
     }
+
+    /// An agxps bandwidth counter in GB/s.
+    pub fn gbps(&self, name: &str) -> Option<f64> {
+        self.raw_value(name)
+            .map(|value| MetricUnit::GigabytesPerSecond.display_value(value))
+    }
+
+    /// DRAM (Apple fabric) read + write bandwidth in GB/s.
+    pub fn dram_gbps(&self) -> Option<f64> {
+        match (self.gbps("AF Read Bandwidth"), self.gbps("AF Write Bandwidth")) {
+            (None, None) => None,
+            (read, write) => Some(read.unwrap_or(0.0) + write.unwrap_or(0.0)),
+        }
+    }
+
+    fn raw_value(&self, name: &str) -> Option<f64> {
+        self.values
+            .get(name)
+            .copied()
+            .filter(|value| value.is_finite())
+    }
+}
+
+type ReportCache = Mutex<BTreeMap<PathBuf, std::result::Result<Arc<HwCounterReport>, String>>>;
+
+/// The report for a trace or profiler directory, computed once per process
+/// (several report sections read it).
+pub fn cached_report(path: &Path) -> Option<Arc<HwCounterReport>> {
+    cached_report_result(path).ok()
+}
+
+/// [`cached_report`], keeping the reason when there is no report.
+pub fn cached_report_result(path: &Path) -> std::result::Result<Arc<HwCounterReport>, String> {
+    static CACHE: OnceLock<ReportCache> = OnceLock::new();
+    let dir = if path.join("streamData").is_file() {
+        path.to_path_buf()
+    } else {
+        profiler::find_profiler_directory(path)
+            .ok_or_else(|| format!("no MTLReplayer profile next to {}", path.display()))?
+    };
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap().get(&dir) {
+        return hit.clone();
+    }
+    let names = profiler::stream_data_summary(&dir)
+        .map(|summary| dispatch_names(&summary))
+        .unwrap_or_default();
+    let report = report_for_profiler_dir(&dir, &names)
+        .map(Arc::new)
+        .map_err(|error| {
+            tracing::warn!(%error, dir = %dir.display(), "hardware counters unavailable");
+            error.to_string()
+        });
+    cache.lock().unwrap().insert(dir, report.clone());
+    report
 }
 
 /// A kick of the limiter pass, in one clock domain.
@@ -1413,6 +1620,38 @@ fn gprw_records(blob: &[u8], words: usize) -> Vec<Vec<u64>> {
         offset += size;
     }
     records
+}
+
+/// counters.md: the tables of [`format_report`] with a legend.
+pub fn format_markdown(report: &HwCounterReport) -> String {
+    let mut out = String::from("# Counters\n\n");
+    out.push_str(
+        "Hardware counters from MTLReplayer's limiter pass, evaluated with Xcode's agxps \
+         formulas for this exact GPU. Per-encoder rows are exact (samples are attributed by \
+         the encoder's own GPU kicks). Per-dispatch and per-kernel rows split samples between \
+         dispatches by their measured residency on each shader core; `shrd%` says how much of \
+         a row came from such shared samples. `frgn%` is the fraction of a row's time during \
+         which another process also ran on the GPU: those counts are mixed in. \
+         How it works and what was validated: `docs/COUNTERS_M4.md` in gputrace-rs.\n\n",
+    );
+    out.push_str("| column | agxps counter | unit | meaning | oracle check |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for spec in METRICS {
+        let unit = match spec.unit {
+            MetricUnit::Percent => "%",
+            MetricUnit::GigabytesPerSecond => "GB/s",
+            MetricUnit::Bytes => "bytes",
+            MetricUnit::Count => "count",
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {unit} | {} | {} |\n",
+            spec.label, spec.name, spec.meaning, spec.oracle
+        ));
+    }
+    out.push_str("\n```text\n");
+    out.push_str(&format_report(report));
+    out.push_str("```\n");
+    out
 }
 
 pub fn format_report(report: &HwCounterReport) -> String {

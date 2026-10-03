@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::counter;
 use crate::error::Result;
 use crate::profiler;
 use crate::shaders;
@@ -40,7 +39,6 @@ pub struct CorrelatedShader {
     pub sample_count: usize,
     pub avg_sampling_density: f64,
     pub occupancy_percent: Option<f64>,
-    pub occupancy_confidence: Option<f64>,
     pub alu_utilization_percent: Option<f64>,
     pub last_level_cache_percent: Option<f64>,
     pub device_memory_bandwidth_gbps: Option<f64>,
@@ -61,7 +59,6 @@ pub struct CorrelatedShader {
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<CorrelationReport> {
     let timing = timing::report(trace)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
     let shader_report = shaders::report(trace, search_paths)?;
     let kernel_stats = trace.analyze_kernels()?;
@@ -76,7 +73,6 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
     let mut correlated_sources = 0usize;
     let mut sample_stats = BTreeMap::<String, (usize, f64, usize)>::new();
     let mut execution_cost_by_name = BTreeMap::<String, (f64, usize)>::new();
-    let mut limiter_by_name = BTreeMap::<String, (f64, f64, f64, usize)>::new();
     if let Some(summary) = &profiler_summary {
         for dispatch in &summary.dispatches {
             let name = dispatch
@@ -96,23 +92,6 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             let entry = execution_cost_by_name.entry(name).or_default();
             entry.0 += cost.cost_percent;
             entry.1 += cost.sample_count;
-        }
-        for limiter in &limiter_metrics {
-            for dispatch in summary
-                .dispatches
-                .iter()
-                .filter(|dispatch| dispatch.encoder_index == limiter.encoder_index)
-            {
-                let name = dispatch
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-                let entry = limiter_by_name.entry(name).or_default();
-                entry.0 += limiter.alu_utilization.unwrap_or(0.0);
-                entry.1 += limiter.last_level_cache.unwrap_or(0.0);
-                entry.2 += limiter.device_memory_bandwidth_gbps.unwrap_or(0.0);
-                entry.3 += 1;
-            }
         }
     }
 
@@ -149,16 +128,6 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             .get(&kernel.name)
             .map(|(percent, samples)| (Some(*percent), *samples))
             .unwrap_or((None, 0));
-        let limiter =
-            limiter_by_name
-                .get(&kernel.name)
-                .and_then(|(alu_sum, llc_sum, bw_sum, count)| {
-                    (*count > 0).then_some((
-                        alu_sum / *count as f64,
-                        llc_sum / *count as f64,
-                        bw_sum / *count as f64,
-                    ))
-                });
         let metric_source = if execution_cost_percent.is_some() {
             "execution-cost"
         } else if source.and_then(|shader| shader.total_duration_ns).is_some() {
@@ -194,16 +163,10 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             sample_count,
             avg_sampling_density,
             occupancy_percent: source.and_then(|shader| shader.occupancy_percent),
-            occupancy_confidence: source.and_then(|shader| shader.occupancy_confidence),
-            alu_utilization_percent: limiter
-                .map(|(alu, _, _)| alu)
-                .or_else(|| source.and_then(|shader| shader.alu_utilization_percent)),
-            last_level_cache_percent: limiter
-                .map(|(_, llc, _)| llc)
-                .or_else(|| source.and_then(|shader| shader.last_level_cache_percent)),
-            device_memory_bandwidth_gbps: limiter
-                .map(|(_, _, bw)| bw)
-                .or_else(|| source.and_then(|shader| shader.device_memory_bandwidth_gbps)),
+            alu_utilization_percent: source.and_then(|shader| shader.alu_utilization_percent),
+            last_level_cache_percent: source.and_then(|shader| shader.last_level_cache_percent),
+            device_memory_bandwidth_gbps: source
+                .and_then(|shader| shader.device_memory_bandwidth_gbps),
             temporary_register_count: source.and_then(|shader| shader.temporary_register_count),
             spilled_bytes: source.and_then(|shader| shader.spilled_bytes),
             threadgroup_memory: source.and_then(|shader| shader.threadgroup_memory),
@@ -311,7 +274,7 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
         ));
         if verbose {
             out.push_str(&format!(
-                "           avg={} ns source={} samples/us={:.3} exec_samples={} weight_pct={} alu_perf={} occ={} occ_conf={} alu={} llc={} dev_bw={} regs={} spills={} tgmem={} inst={} alu_inst={} branch_inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
+                "           avg={} ns source={} samples/us={:.3} exec_samples={} weight_pct={} alu_perf={} occ={} alu={} llc={} dev_bw={} regs={} spills={} tgmem={} inst={} alu_inst={} branch_inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
                 shader.synthetic_avg_duration_ns,
                 shader.metric_source,
                 shader.avg_sampling_density,
@@ -326,10 +289,6 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
                     .unwrap_or_else(|| "-".to_owned()),
                 shader
                     .occupancy_percent
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "-".to_owned()),
-                shader
-                    .occupancy_confidence
                     .map(|value| format!("{value:.2}"))
                     .unwrap_or_else(|| "-".to_owned()),
                 shader
@@ -430,7 +389,6 @@ mod tests {
                 sample_count: 4,
                 avg_sampling_density: 0.2,
                 occupancy_percent: Some(41.0),
-                occupancy_confidence: Some(0.9),
                 alu_utilization_percent: Some(61.0),
                 last_level_cache_percent: Some(0.04),
                 device_memory_bandwidth_gbps: Some(8.2),

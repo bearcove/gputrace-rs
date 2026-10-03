@@ -2,8 +2,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 use crate::analysis;
-use crate::counter;
 use crate::error::{Error, Result};
+use crate::hw_counters::{self, HwCounterRow};
 use crate::profiler;
 use crate::shaders;
 use crate::timing;
@@ -409,9 +409,6 @@ pub fn report_with_context(
 
     if let Some(summary) = &profiler_summary {
         let mut pipeline_stats_by_name = BTreeMap::new();
-        let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
-        let mut limiter_by_name =
-            BTreeMap::<String, (f64, f64, f64, f64, f64, f64, f64, f64, usize)>::new();
         for pipeline in &summary.pipelines {
             if let (Some(name), Some(stats)) = (&pipeline.function_name, &pipeline.stats) {
                 pipeline_stats_by_name
@@ -419,44 +416,19 @@ pub fn report_with_context(
                     .or_insert_with(|| stats.clone());
             }
         }
-        for occupancy in &summary.occupancies {
-            for dispatch in summary
-                .dispatches
-                .iter()
-                .filter(|dispatch| dispatch.encoder_index == occupancy.encoder_index)
-            {
-                let name = dispatch
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-                let entry = occupancy_by_name.entry(name).or_default();
-                entry.0 += occupancy.occupancy_percent;
-                entry.1 += occupancy.confidence;
-                entry.2 += 1;
-            }
-        }
-        for limiter in counter::extract_limiters_for_trace(&trace.path) {
-            for dispatch in summary
-                .dispatches
-                .iter()
-                .filter(|dispatch| dispatch.encoder_index == limiter.encoder_index)
-            {
-                let name = dispatch
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-                let entry = limiter_by_name.entry(name).or_default();
-                entry.0 += limiter.occupancy_manager.unwrap_or(0.0);
-                entry.1 += limiter.instruction_throughput.unwrap_or(0.0);
-                entry.2 += limiter.integer_complex.unwrap_or(0.0);
-                entry.3 += limiter.f32_limiter.unwrap_or(0.0);
-                entry.4 += limiter.l1_cache.unwrap_or(0.0);
-                entry.5 += limiter.control_flow.unwrap_or(0.0);
-                entry.6 += limiter.last_level_cache.unwrap_or(0.0);
-                entry.7 += limiter.device_memory_bandwidth_gbps.unwrap_or(0.0);
-                entry.8 += 1;
-            }
-        }
+        // Per-kernel hardware counters from the limiter pass.
+        let hw_report = hw_counters::cached_report(&trace.path);
+        let hw_by_name = hw_report
+            .as_deref()
+            .map(|report| {
+                report
+                    .kernels
+                    .iter()
+                    .map(|row| (row.label.clone(), row.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let peak_dram_gbps = hw_report.as_deref().map(|report| report.gpu.peak_dram_gbps);
 
         let mut sample_totals = BTreeMap::<String, (usize, u64, usize, f64)>::new();
         let mut total_samples = 0usize;
@@ -506,35 +478,9 @@ pub fn report_with_context(
         }
 
         for kernel in &timing.kernels {
-            if let Some((occupancy_sum, confidence_sum, count)) =
-                occupancy_by_name.get(&kernel.name)
-                && *count > 0
-            {
-                let occupancy = occupancy_sum / *count as f64;
-                let confidence = confidence_sum / *count as f64;
-                if occupancy < 30.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Optimization,
-                        severity: if occupancy < 15.0 {
-                            InsightSeverity::High
-                        } else {
-                            InsightSeverity::Medium
-                        },
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} shows low kernel occupancy", kernel.name),
-                        description: format!(
-                            "{} averages {:.1}% kernel occupancy with {:.2} confidence across profiler samples.",
-                            kernel.name, occupancy, confidence
-                        ),
-                        recommendations: vec![
-                            "Revisit threadgroup sizing before deeper micro-optimizations.".to_owned(),
-                            "Check register pressure and threadgroup memory for occupancy limiters.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Low occupancy can leave GPU execution resources underutilized.".to_owned(),
-                        ),
-                    });
-                }
+            let hw = hw_by_name.get(&kernel.name);
+            if let Some(row) = hw {
+                hw_counter_insights(&kernel.name, row, peak_dram_gbps, &mut insights);
             }
 
             let Some(stats) = pipeline_stats_by_name.get(&kernel.name) else {
@@ -606,152 +552,6 @@ pub fn report_with_context(
                         "Large threadgroup allocations can reduce active wave occupancy.".to_owned(),
                     ),
                 });
-            }
-
-            if let Some((
-                occ_mgr_sum,
-                instr_sum,
-                int_sum,
-                f32_sum,
-                l1_sum,
-                control_sum,
-                llc_sum,
-                dev_bw_sum,
-                count,
-            )) = limiter_by_name.get(&kernel.name)
-                && *count > 0
-            {
-                let occ_mgr = occ_mgr_sum / *count as f64;
-                let instruction = instr_sum / *count as f64;
-                let integer_complex = int_sum / *count as f64;
-                let f32 = f32_sum / *count as f64;
-                let l1 = l1_sum / *count as f64;
-                let control_flow = control_sum / *count as f64;
-                let llc = llc_sum / *count as f64;
-                let device_bw = dev_bw_sum / *count as f64;
-
-                if occ_mgr >= 60.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Bottleneck,
-                        severity: InsightSeverity::High,
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} is occupancy-limited", kernel.name),
-                        description: format!(
-                            "{} shows {:.1}% occupancy-manager pressure in counter samples.",
-                            kernel.name, occ_mgr
-                        ),
-                        recommendations: vec![
-                            "Reduce register pressure or threadgroup memory before chasing smaller effects.".to_owned(),
-                            "Try smaller threadgroups if occupancy is low and the shader is spill-heavy.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Suggests active-wave residency is constraining throughput.".to_owned(),
-                        ),
-                    });
-                }
-
-                if instruction >= 2.0 || f32 >= 2.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Bottleneck,
-                        severity: InsightSeverity::Medium,
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} shows instruction throughput pressure", kernel.name),
-                        description: format!(
-                            "{} averages {:.2}% instruction-throughput, {:.2}% integer/complex, and {:.2}% F32 limiter pressure.",
-                            kernel.name, instruction, integer_complex, f32
-                        ),
-                        recommendations: vec![
-                            "Inspect the hot path for instruction-heavy loops or unnecessary precision.".to_owned(),
-                            "Compare specialized variants to see whether arithmetic intensity is worth the extra instructions.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Indicates shader execution may be limited by arithmetic issue throughput."
-                                .to_owned(),
-                        ),
-                    });
-                }
-
-                if l1 >= 2.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Bottleneck,
-                        severity: InsightSeverity::Medium,
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} shows L1 cache pressure", kernel.name),
-                        description: format!(
-                            "{} averages {:.2}% L1-cache limiter pressure in counter samples.",
-                            kernel.name, l1
-                        ),
-                        recommendations: vec![
-                            "Inspect bound buffers and access stride for cache-unfriendly patterns.".to_owned(),
-                            "Consider staging hot working sets into threadgroup memory only if occupancy stays acceptable.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Suggests memory locality, not pure ALU work, is constraining this shader."
-                                .to_owned(),
-                        ),
-                    });
-                }
-
-                if control_flow >= 2.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Bottleneck,
-                        severity: InsightSeverity::Medium,
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} shows control-flow pressure", kernel.name),
-                        description: format!(
-                            "{} averages {:.2}% control-flow limiter pressure in counter samples.",
-                            kernel.name, control_flow
-                        ),
-                        recommendations: vec![
-                            "Inspect hot branches with `shader-hotspots` to reduce divergence.".to_owned(),
-                            "Prefer branchless or more uniform paths when the algorithm allows it.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Suggests branch divergence or serialized control flow is constraining throughput."
-                                .to_owned(),
-                        ),
-                    });
-                }
-
-                if llc >= 2.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Bottleneck,
-                        severity: InsightSeverity::Medium,
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} shows last-level cache pressure", kernel.name),
-                        description: format!(
-                            "{} averages {:.2}% last-level-cache limiter pressure in counter samples.",
-                            kernel.name, llc
-                        ),
-                        recommendations: vec![
-                            "Check whether working sets exceed L1 and spill into broader memory traffic.".to_owned(),
-                            "Use `buffer-access` and `shader-hotspots` to inspect large-stride reads.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Suggests cache residency beyond L1 is limiting throughput.".to_owned(),
-                        ),
-                    });
-                }
-
-                if device_bw >= 5.0 && l1 >= 1.0 {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Bottleneck,
-                        severity: InsightSeverity::Medium,
-                        shader_name: Some(kernel.name.clone()),
-                        title: format!("{} is driving notable device-memory bandwidth", kernel.name),
-                        description: format!(
-                            "{} averages {:.2} GB/s of inferred device-memory bandwidth with {:.2}% L1 pressure.",
-                            kernel.name, device_bw, l1
-                        ),
-                        recommendations: vec![
-                            "Reduce redundant global-memory traffic before micro-optimizing arithmetic.".to_owned(),
-                            "Consider staging hot data into threadgroup memory if occupancy stays acceptable.".to_owned(),
-                        ],
-                        impact: Some(
-                            "Points to memory-system pressure rather than pure ALU throughput.".to_owned(),
-                        ),
-                    });
-                }
             }
         }
     }
@@ -926,6 +726,138 @@ pub fn report_with_context(
         info_count,
         insights,
     })
+}
+
+/// Compute-relevant agxps limiters: each is the busy fraction of one unit,
+/// relative to that unit's peak.
+const COMPUTE_LIMITERS: &[(&str, &str)] = &[
+    ("ALU Limiter", "ALU"),
+    ("F32 Limiter", "F32 ALU"),
+    ("F16 Limiter", "F16 ALU"),
+    ("IC Limiter", "integer/complex ALU"),
+    ("MXU Limiter", "matrix unit"),
+    ("Instruction Issue Limiter", "instruction issue"),
+    ("Instruction Dispatch Limiter", "instruction dispatch"),
+    ("Control Flow Limiter", "control flow"),
+    ("Address Generation Limiter", "address generation"),
+    ("Buffer Load Limiter", "buffer loads"),
+    ("Buffer Store Limiter", "buffer stores"),
+    ("Threadgroup Load Limiter", "threadgroup memory loads"),
+    ("Threadgroup Store Limiter", "threadgroup memory stores"),
+    ("Threadgroup Atomic Limiter", "threadgroup atomics"),
+    ("L1 Cache Limiter", "L1 cache"),
+    ("L2 Cache Limiter", "L2 cache"),
+    ("MMU Limiter", "MMU (address translation)"),
+    ("Compute Shader Launch Limiter", "compute launch"),
+];
+
+/// Kernels shorter than this (summed over their dispatches) carry too few
+/// counter samples for a verdict.
+const HW_INSIGHT_MIN_GPU_NS: f64 = 20_000.0;
+
+fn hw_counter_insights(
+    kernel: &str,
+    row: &HwCounterRow,
+    peak_dram_gbps: Option<f64>,
+    insights: &mut Vec<PerformanceInsight>,
+) {
+    if row.gpu_time_ns < HW_INSIGHT_MIN_GPU_NS {
+        return;
+    }
+    let caveat = if row.foreign_overlap > 0.2 {
+        format!(
+            " Another process ran on the GPU for {:.0}% of this kernel's time, so these counts include its work.",
+            row.foreign_overlap * 100.0
+        )
+    } else {
+        String::new()
+    };
+    let top_limiter = COMPUTE_LIMITERS
+        .iter()
+        .filter_map(|(name, unit)| Some((*name, *unit, row.percent(name)?)))
+        .max_by(|left, right| left.2.total_cmp(&right.2));
+    let dram = row.dram_gbps();
+    let occupancy = row.percent("Compute Occupancy");
+
+    if let Some((name, unit, value)) = top_limiter
+        && value >= 60.0
+    {
+        insights.push(PerformanceInsight {
+            insight_type: InsightType::Bottleneck,
+            severity: if value >= 80.0 {
+                InsightSeverity::High
+            } else {
+                InsightSeverity::Medium
+            },
+            shader_name: Some(kernel.to_owned()),
+            title: format!("{kernel} is limited by {unit}"),
+            description: format!(
+                "{kernel}: `{name}` is {value:.0}% (busy fraction of that unit's peak, limiter-pass hardware counters).{caveat}"
+            ),
+            recommendations: vec![
+                format!("Reduce the work this kernel puts on {unit}, or trade it for a less busy unit."),
+                "See counters.md for the kernel's full counter row.".to_owned(),
+            ],
+            impact: Some(format!(
+                "{unit} saturates first; other optimizations will not help until it is relieved."
+            )),
+        });
+    }
+
+    if let (Some(dram), Some(peak)) = (dram, peak_dram_gbps)
+        && peak > 0.0
+        && dram >= 0.6 * peak
+    {
+        insights.push(PerformanceInsight {
+            insight_type: InsightType::Bottleneck,
+            severity: if dram >= 0.8 * peak {
+                InsightSeverity::High
+            } else {
+                InsightSeverity::Medium
+            },
+            shader_name: Some(kernel.to_owned()),
+            title: format!("{kernel} runs near DRAM bandwidth peak"),
+            description: format!(
+                "{kernel} moves {dram:.1} GB/s to and from DRAM, {:.0}% of the {peak:.0} GB/s peak.{caveat}",
+                dram / peak * 100.0
+            ),
+            recommendations: vec![
+                "Cut DRAM traffic: smaller data types, fusion with neighbouring kernels, or better reuse in cache.".to_owned(),
+            ],
+            impact: Some("Memory-bound: arithmetic changes will not speed it up.".to_owned()),
+        });
+    }
+
+    let busiest = top_limiter.map(|(_, _, value)| value).unwrap_or(0.0);
+    let dram_fraction = match (dram, peak_dram_gbps) {
+        (Some(dram), Some(peak)) if peak > 0.0 => dram / peak,
+        _ => 0.0,
+    };
+    if let Some(occupancy) = occupancy
+        && occupancy < 25.0
+        && busiest < 40.0
+        && dram_fraction < 0.4
+    {
+        insights.push(PerformanceInsight {
+            insight_type: InsightType::Optimization,
+            severity: if occupancy < 10.0 {
+                InsightSeverity::High
+            } else {
+                InsightSeverity::Medium
+            },
+            shader_name: Some(kernel.to_owned()),
+            title: format!("{kernel} is latency-bound at low occupancy"),
+            description: format!(
+                "{kernel} averages {occupancy:.1}% compute occupancy while no unit is above {busiest:.0}% busy and DRAM is at {:.0}% of peak.{caveat}",
+                dram_fraction * 100.0
+            ),
+            recommendations: vec![
+                "Launch more threads (larger grid or split-K) if the problem is too small to fill the GPU.".to_owned(),
+                "Otherwise check register and threadgroup-memory use, which cap resident SIMD groups.".to_owned(),
+            ],
+            impact: Some("The GPU is mostly idle waiting on latency.".to_owned()),
+        });
+    }
 }
 
 pub fn format_report(report: &InsightsReport) -> String {
