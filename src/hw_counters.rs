@@ -1352,6 +1352,32 @@ fn match_commands(
             .or_default()
             .push((*first, *esl));
     }
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for clique in &profile.work_cliques {
+            *counts.entry(clique.esl_index).or_default() += 1;
+        }
+        for (software_id, candidates) in &by_kick {
+            let mut groups = candidates
+                .iter()
+                .map(|(first, esl)| (*first, *esl, counts.get(esl).copied().unwrap_or(0)))
+                .collect::<Vec<_>>();
+            groups.sort_unstable();
+            let mut commands = profile
+                .commands
+                .iter()
+                .filter(|command| command.software_id == *software_id)
+                .map(|command| (command.start_ticks, format!("{:#x}", command.esl_shader_address)))
+                .collect::<Vec<_>>();
+            commands.sort_unstable();
+            tracing::trace!(
+                kick = format!("{software_id:#x}"),
+                ?groups,
+                ?commands,
+                "hw counters: esl groups (first start, esl index, cliques) vs analyzer commands"
+            );
+        }
+    }
     let mut out = BTreeMap::new();
     let mut order = (0..profile.commands.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| profile.commands[*index].start_ticks);
