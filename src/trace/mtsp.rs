@@ -48,6 +48,10 @@ pub enum RecordType {
     Cut,
     Cuw,
     CUUU,
+    /// `CUt`: an object's reference to a bundle blob by key (address, then the
+    /// key as a C string). Specialized `MTLFunction`s carry their descriptor
+    /// this way instead of a `CS` name record.
+    CUt,
     Ci,
     CiulSl,
     Ciulul,
@@ -72,6 +76,7 @@ impl fmt::Display for RecordType {
             Self::Cut => "Cut",
             Self::Cuw => "Cuw",
             Self::CUUU => "CUUU",
+            Self::CUt => "CUt",
             Self::Ci => "Ci",
             Self::CiulSl => "CiulSl",
             Self::Ciulul => "Ciulul",
@@ -124,6 +129,7 @@ impl MTSPRecord {
 
             match record.record_type {
                 RecordType::CS => record.parse_cs_record(),
+                RecordType::CUt => record.parse_cut_blob_record(),
                 RecordType::CSuwuw => record.parse_csuwuw_record(),
                 RecordType::CiulSl => record.parse_ciulsl_record(),
                 RecordType::CU | RecordType::Cut => record.parse_cu_record(),
@@ -196,6 +202,7 @@ impl MTSPRecord {
             };
             match record.record_type {
                 RecordType::CS => record.parse_cs_record(),
+                RecordType::CUt => record.parse_cut_blob_record(),
                 RecordType::CSuwuw => record.parse_csuwuw_record(),
                 RecordType::CiulSl => record.parse_ciulsl_record(),
                 RecordType::CU | RecordType::Cut => record.parse_cu_record(),
@@ -261,12 +268,16 @@ impl MTSPRecord {
         let Some(base) = find_bytes(&self.data, b"Ctt\0") else {
             return Err(Error::InvalidTrace("Ctt marker not found"));
         };
-        if base + 0x30 > self.data.len() {
+        // Fixed fields end with the pipeline address at base + 0x20; the
+        // binding table header (base + 0x28) is absent when there are no
+        // bindings (`newComputePipelineStateWithFunction:` records are 76
+        // bytes).
+        if base + 0x28 > self.data.len() {
             return Err(Error::InvalidTrace("Ctt record too small"));
         }
 
-        let binding_count = read_u32(&self.data, base + 0x28)?;
-        let stride = read_u32(&self.data, base + 0x2c)?;
+        let binding_count = read_u32(&self.data, base + 0x28).unwrap_or(0);
+        let stride = read_u32(&self.data, base + 0x2c).unwrap_or(0);
         let mut buffer_bindings = Vec::new();
         let mut resource_bindings = Vec::new();
         if binding_count > 0 && stride == 8 {
@@ -566,6 +577,33 @@ impl MTSPRecord {
         self.label = read_c_string(&self.data, str_start);
     }
 
+    /// For a factory call (`newFunctionWithName:`, `newFunctionWithDescriptor:`
+    /// and the like), the object it returned: the address after the `t`
+    /// marker that follows the arguments. `setLabel:`-style records have none.
+    pub fn returned_address(&self) -> Option<u64> {
+        let label_end = self
+            .label
+            .as_ref()
+            .and_then(|label| find_bytes(&self.data, label.as_bytes()).map(|start| start + label.len()))?;
+        let marker = find_bytes(&self.data[label_end..], b"t\0\0\0")? + label_end;
+        if self.data[label_end..marker].iter().any(|&byte| byte != 0) {
+            return None;
+        }
+        read_u64(&self.data, marker + 4).ok().filter(|&address| address != 0)
+    }
+
+    fn parse_cut_blob_record(&mut self) {
+        let Some(base) = find_bytes(&self.data, b"CUt\0") else {
+            return;
+        };
+        let addr_start = base + 4;
+        if addr_start + 8 > self.data.len() {
+            return;
+        }
+        self.address = read_u64(&self.data, addr_start).ok();
+        self.label = read_c_string(&self.data, addr_start + 8);
+    }
+
     fn parse_cs_record(&mut self) {
         let Some(base) = find_bytes(&self.data, b"CS\0\0") else {
             return;
@@ -846,6 +884,9 @@ fn detect_record_type(data: &[u8]) -> RecordType {
         }
         if starts_with_at(data, i, b"CUUU") {
             return RecordType::CUUU;
+        }
+        if starts_with_at(data, i, b"CUt\0") {
+            return RecordType::CUt;
         }
         if starts_with_at(data, i, b"CU") && data.get(i + 2) == Some(&0) {
             return RecordType::CU;

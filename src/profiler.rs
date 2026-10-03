@@ -543,7 +543,84 @@ pub fn stream_data_summary<P: AsRef<Path>>(path: P) -> Result<ProfilerStreamData
     if !stream_data_path.is_file() {
         return Err(Error::MissingFile(stream_data_path));
     }
-    parse_stream_data(&stream_data_path, Some(&profiler_directory))
+    let mut summary = parse_stream_data(&stream_data_path, Some(&profiler_directory))?;
+    if let Some(names) = trace_function_names(&input_path) {
+        summary.fill_function_names(&names);
+    }
+    Ok(summary)
+}
+
+/// Raw profiler file families a complete MTLReplayer profile writes next to
+/// `streamData` that are absent (None when there is no profile at all).
+pub fn missing_profile_families(path: &Path) -> Option<Vec<&'static str>> {
+    let directory = find_profiler_directory(path)?;
+    if !directory.join("streamData").is_file() {
+        return None;
+    }
+    let names: Vec<String> = fs::read_dir(&directory)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    Some(
+        ["Profiling_f_", "Counters_f_"]
+            .into_iter()
+            .filter(|prefix| !names.iter().any(|name| name.starts_with(prefix)))
+            .map(|prefix| prefix.trim_end_matches('_'))
+            .collect(),
+    )
+}
+
+/// The capture's own pipeline → function map for the bundle at `path`, built
+/// once per process (every report section asks for the stream summary).
+fn trace_function_names(path: &Path) -> Option<std::sync::Arc<crate::trace::PipelineFunctionMap>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Option<Arc<crate::trace::PipelineFunctionMap>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cache = cache.lock().ok()?;
+    cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| {
+            crate::trace::TraceBundle::open(path)
+                .and_then(|trace| trace.pipeline_function_map())
+                .map(Arc::new)
+                .ok()
+        })
+        .clone()
+}
+
+impl ProfilerStreamDataSummary {
+    /// streamData leaves functions specialized from a descriptor (function
+    /// constants: MLX's attention, RoPE, ...) unnamed; take their names from
+    /// the capture's pipeline → function map, by pipeline address.
+    pub fn fill_function_names(&mut self, names: &BTreeMap<u64, String>) {
+        let unnamed = |name: &Option<String>| name.as_deref().is_none_or(str::is_empty);
+        for pipeline in &mut self.pipelines {
+            if unnamed(&pipeline.function_name)
+                && let Some(name) = names.get(&pipeline.pipeline_address)
+            {
+                pipeline.function_name = Some(name.clone());
+            }
+        }
+        for dispatch in &mut self.dispatches {
+            if unnamed(&dispatch.function_name) {
+                dispatch.function_name = self
+                    .pipelines
+                    .get(dispatch.pipeline_index)
+                    .and_then(|pipeline| pipeline.function_name.clone());
+            }
+        }
+        for cost in &mut self.execution_costs {
+            if unnamed(&cost.function_name) {
+                cost.function_name = self
+                    .pipelines
+                    .iter()
+                    .find(|pipeline| pipeline.pipeline_id == cost.pipeline_id)
+                    .and_then(|pipeline| pipeline.function_name.clone());
+            }
+        }
+    }
 }
 
 fn profiler_files(profiler_directory: &Path) -> Result<Vec<ProfilerCoverageFile>> {

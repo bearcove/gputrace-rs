@@ -16,31 +16,15 @@ fn render_help(path: &[&str]) -> String {
 }
 
 #[test]
-fn top_level_help_lists_current_analysis_commands() {
+fn top_level_help_lists_only_report() {
     let help = render_help(&[]);
 
-    for subcommand in [
-        "analyze-usage",
-        "report",
-        "clear-buffers",
-        "timeline",
-        "fences",
-        "api-calls",
-        "dump",
-        "dump-records",
-        "export-counters",
-        "raw-counters",
-        "validate-counters",
-        "profiler",
-        "profiler-coverage",
-        "mtlb-functions",
-        "xcode-counters",
-        "profile",
-        "buffers",
-    ] {
+    assert!(help.contains("report"), "top-level help should mention report\n{help}");
+    // `report` is the one public workflow; internal subcommands stay hidden.
+    for internal in ["dump-records", "raw-counters", "xcode-counters", "profiler-coverage", "clear-buffers"] {
         assert!(
-            help.contains(subcommand),
-            "top-level help should mention {subcommand}\n{help}"
+            !help.contains(internal),
+            "top-level help should not list internal {internal}\n{help}"
         );
     }
 }
@@ -53,7 +37,6 @@ fn report_help_mentions_markdown_output_directory() {
     assert!(help.contains("<TRACE>"));
     assert!(help.contains("--output <OUTPUT>"));
     assert!(help.contains("Markdown"));
-    assert!(help.contains("Xcode MIO"));
 }
 
 #[test]

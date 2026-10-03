@@ -2163,6 +2163,8 @@ fn parse_record_type(value: &str) -> Result<RecordType> {
         "Cul" => Ok(RecordType::Cul),
         "Culul" => Ok(RecordType::Culul),
         "Cut" => Ok(RecordType::Cut),
+        "CUt" => Ok(RecordType::CUt),
+        "CUUU" => Ok(RecordType::CUUU),
         "Cuw" => Ok(RecordType::Cuw),
         "Ci" => Ok(RecordType::Ci),
         "CiulSl" => Ok(RecordType::CiulSl),

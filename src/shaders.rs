@@ -297,7 +297,9 @@ pub fn report_with_context(
     }
 
     let kernels = trace.analyze_kernels().unwrap_or_default();
-    let kernels = if kernels.is_empty() {
+    // The byte stream names pipelines but may attribute no dispatches (they
+    // live in per-command-buffer artifact files); profiler counts win then.
+    let kernels = if kernels.values().all(|kernel| kernel.dispatch_count == 0) {
         profiler_summary
             .map(profiler_kernel_stats)
             .unwrap_or_default()

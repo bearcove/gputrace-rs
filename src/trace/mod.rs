@@ -216,15 +216,64 @@ impl TraceBundle {
         MTSPRecord::parse_stream(&data)
     }
 
+    /// Blobs packed into the bundle's `store0`: a run of zlib streams, each
+    /// keyed (in `index`, and by the records that reference it) by the
+    /// uppercase hex xxh64 of its decompressed bytes, without zero padding.
+    /// Blobs too small for a file of their own live here, among them the
+    /// descriptors of specialized functions.
+    pub fn store_blobs(&self) -> Result<BTreeMap<String, Vec<u8>>> {
+        let path = self.path.join("store0");
+        let mut blobs = BTreeMap::new();
+        let Ok(data) = fs::read(&path) else {
+            return Ok(blobs);
+        };
+        let mut offset = 0;
+        while offset < data.len() {
+            let mut decoder = flate2::Decompress::new(true);
+            let mut out = Vec::new();
+            loop {
+                out.reserve(64 * 1024);
+                let before_in = decoder.total_in();
+                let status = decoder
+                    .decompress_vec(&data[offset..], &mut out, flate2::FlushDecompress::None)
+                    .map_err(|_| Error::InvalidTrace("store0: bad zlib stream"))?;
+                if status == flate2::Status::StreamEnd {
+                    break;
+                }
+                if decoder.total_in() == before_in && out.len() < out.capacity() {
+                    return Err(Error::InvalidTrace("store0: truncated zlib stream"));
+                }
+            }
+            offset += decoder.total_in() as usize;
+            blobs.insert(format!("{:X}", xxhash_rust::xxh64::xxh64(&out, 0)), out);
+        }
+        Ok(blobs)
+    }
+
     pub fn pipeline_function_map(&self) -> Result<PipelineFunctionMap> {
         let capture = self.capture_data()?;
         let mut label_map = BTreeMap::new();
-        collect_labels_from_data(&capture, &mut label_map)?;
+        let mut blob_refs = BTreeMap::new();
+        collect_labels_from_data(&capture, &mut label_map, &mut blob_refs)?;
         for resource in &self.device_resources {
             let data = fs::read(&resource.path)?;
-            collect_labels_from_data(&data, &mut label_map)?;
+            collect_labels_from_data(&data, &mut label_map, &mut blob_refs)?;
+        }
+        // Specialized functions have no CS name record; their CUt record
+        // points at a descriptor blob that names them.
+        if blob_refs.keys().any(|address| !label_map.contains_key(address)) {
+            let blobs = self.store_blobs()?;
+            for (address, key) in blob_refs {
+                if let Some(name) = blobs.get(&key).and_then(|blob| function_descriptor_name(blob)) {
+                    label_map.entry(address).or_insert(name);
+                }
+            }
         }
 
+        tracing::debug!(labels = label_map.len(), "function labels");
+        for (address, label) in &label_map {
+            tracing::trace!(address = format_args!("{address:#x}"), %label, "function label");
+        }
         let mut result = BTreeMap::new();
         collect_pipeline_mappings_from_data(&capture, &label_map, &mut result)?;
         for resource in &self.device_resources {
@@ -259,7 +308,13 @@ impl TraceBundle {
             if record.record_type != RecordType::C3ul {
                 continue;
             }
-            let dispatch = record.parse_dispatch_record()?;
+            let dispatch = match record.parse_dispatch_record() {
+                Ok(dispatch) => dispatch,
+                Err(error) => {
+                    tracing::debug!(offset = record.offset, size = record.size, %error, "skipping dispatch record");
+                    continue;
+                }
+            };
             dispatches.push(DispatchCall {
                 index: dispatches.len(),
                 offset: record.offset,
@@ -602,16 +657,53 @@ fn as_integer(value: &Value) -> Option<i64> {
     }
 }
 
-fn collect_labels_from_data(data: &[u8], labels: &mut BTreeMap<u64, String>) -> Result<()> {
+fn collect_labels_from_data(
+    data: &[u8],
+    labels: &mut BTreeMap<u64, String>,
+    blob_refs: &mut BTreeMap<u64, String>,
+) -> Result<()> {
     let records = MTSPRecord::parse_stream(data)?;
     for record in records {
-        if record.record_type == RecordType::CS
-            && let (Some(address), Some(label)) = (record.address, record.label)
-        {
-            labels.insert(address, label);
+        let (Some(receiver), Some(label)) = (record.address, record.label.clone()) else {
+            continue;
+        };
+        // A factory call names the object it returns (a function made by its
+        // library); a `setLabel:` names its receiver.
+        let address = record.returned_address().unwrap_or(receiver);
+        match record.record_type {
+            RecordType::CS => {
+                labels.insert(address, label);
+            }
+            RecordType::CUt => {
+                blob_refs.insert(address, label);
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// The name of a specialized function from its descriptor blob: a 16-byte
+/// header, then the function name and the specialized name as NUL-padded C
+/// strings, then the constant values. The specialized name, which spells out
+/// the constants, wins when present.
+fn function_descriptor_name(blob: &[u8]) -> Option<String> {
+    let c_string = |start: usize| -> Option<(String, usize)> {
+        let rest = blob.get(start..)?;
+        let end = rest.iter().position(|&byte| byte == 0)?;
+        let text = std::str::from_utf8(&rest[..end]).ok()?;
+        let is_symbol = !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        is_symbol.then(|| (text.to_owned(), start + end))
+    };
+    let (name, end) = c_string(16)?;
+    let specialized_start = blob[end..].iter().position(|&byte| byte != 0)? + end;
+    match c_string(specialized_start) {
+        Some((specialized, _)) if specialized.starts_with(&name) => Some(specialized),
+        _ => Some(name),
+    }
 }
 
 fn collect_pipeline_mappings_from_data(
@@ -624,10 +716,17 @@ fn collect_pipeline_mappings_from_data(
         if record.record_type != RecordType::Ctt {
             continue;
         }
-        if let Ok(ctt) = record.parse_ctt_record()
-            && let Some(label) = labels.get(&ctt.function_addr)
-        {
-            result.insert(ctt.pipeline_addr, label.clone());
+        if let Ok(ctt) = record.parse_ctt_record() {
+            let label = labels.get(&ctt.function_addr);
+            tracing::trace!(
+                pipeline = format_args!("{:#x}", ctt.pipeline_addr),
+                function = format_args!("{:#x}", ctt.function_addr),
+                label = label.map(String::as_str).unwrap_or("-"),
+                "pipeline"
+            );
+            if let Some(label) = label {
+                result.insert(ctt.pipeline_addr, label.clone());
+            }
         }
     }
     Ok(())
@@ -639,7 +738,15 @@ fn collect_buffer_names_from_data(data: &[u8], names: &mut BTreeMap<u64, String>
         if record.record_type != RecordType::CtU {
             continue;
         }
-        let ctu = record.parse_ctu_record()?;
+        // One malformed record (seen: short CtU records) must not cost
+        // every section that names buffers.
+        let ctu = match record.parse_ctu_record() {
+            Ok(ctu) => ctu,
+            Err(error) => {
+                tracing::debug!(offset = record.offset, size = record.size, %error, "skipping CtU record");
+                continue;
+            }
+        };
         names.insert(ctu.address, ctu.name);
     }
     Ok(())
@@ -826,7 +933,13 @@ fn parse_pipeline_state_events(
         if record.record_type != RecordType::Ct {
             continue;
         }
-        let ct = record.parse_ct_record()?;
+        let ct = match record.parse_ct_record() {
+            Ok(ct) => ct,
+            Err(error) => {
+                tracing::debug!(offset = record.offset, size = record.size, %error, "skipping Ct record");
+                continue;
+            }
+        };
         events.push(PipelineStateEvent {
             offset: record.offset,
             encoder_addr: ct.function_addr,

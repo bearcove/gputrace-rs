@@ -67,7 +67,19 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
 
     let profiler_summary_start = writer.start_section("shared profiler streamData");
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    writer.record_timing("shared profiler streamData", profiler_summary_start);
+    match profiler::missing_profile_families(&trace.path) {
+        Some(missing) if !missing.is_empty() => writer.record_failure(
+            "shared profiler streamData",
+            &format!(
+                "MTLReplayer wrote no {} files: shader costs and counters are missing, not zero. \
+                 It drops them silently when a capture holds too much GPU work (seen at ~140 ms \
+                 over ~3,000 dispatches); capture a smaller window. Delete gputrace-profile to retry.",
+                missing.join(" / ")
+            ),
+            profiler_summary_start,
+        ),
+        _ => writer.record_timing("shared profiler streamData", profiler_summary_start),
+    }
 
     let raw_counters_start = writer.start_section("shared raw counters");
     let raw_counters = counter::raw_counters_report(&trace).ok();
