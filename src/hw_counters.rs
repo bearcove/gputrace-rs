@@ -1759,6 +1759,19 @@ pub fn format_rows(rows: &[HwCounterRow]) -> String {
     out
 }
 
+/// Every derived counter of each row, one `name = value` line each (agxps
+/// units: fractions, GiB/s, counts).
+pub fn format_all_values(rows: &[HwCounterRow]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&format!("\n{}:\n", row_label(row)));
+        for (name, value) in &row.values {
+            out.push_str(&format!("  {name} = {value:.6}\n"));
+        }
+    }
+    out
+}
+
 fn row_label(row: &HwCounterRow) -> String {
     match row.dispatch_index {
         Some(dispatch) => format!("#{dispatch} {}", row.label),

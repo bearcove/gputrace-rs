@@ -85,7 +85,7 @@ enum CommandSet {
     ProfilingAddressProbe(ProfilingAddressProbeArgs),
     /// Per-encoder hardware counters from the limiter pass (agxps).
     #[command(hide = true)]
-    HwCounters(TracePath),
+    HwCounters(HwCountersArgs),
     #[command(alias = "perfcounters-validate", hide = true)]
     ValidateCounters(ValidateCountersArgs),
     #[command(hide = true)]
@@ -183,6 +183,16 @@ enum CommandSet {
 #[derive(Debug, Args)]
 struct TracePath {
     trace: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct HwCountersArgs {
+    trace: PathBuf,
+    #[arg(
+        long,
+        help = "Also list every derived counter agxps could compute, per kernel"
+    )]
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1564,6 +1574,9 @@ pub fn run() -> Result<()> {
             let trace = TraceBundle::open(&args.trace)?;
             let report = crate::hw_counters::report(&trace)?;
             print!("{}", crate::hw_counters::format_report(&report));
+            if args.all {
+                print!("{}", crate::hw_counters::format_all_values(&report.kernels));
+            }
         }
         CommandSet::SynthBench(args) if args.counter_oracle => {
             let kernels = synth_bench::run_counter_oracle(&args.output)?;
