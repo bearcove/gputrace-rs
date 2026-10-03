@@ -8366,13 +8366,13 @@ mod platform {
         }
         if unsafe { responds_to_selector(value, "allValues") }
             && let Ok(values) = unsafe { send_id_allow_nil(value, "allValues") }
-                && !values.is_null()
-            {
-                let rows = unsafe { decode_numeric_rows_at(values, depth + 1) };
-                if !rows.is_empty() {
-                    return rows;
-                }
+            && !values.is_null()
+        {
+            let rows = unsafe { decode_numeric_rows_at(values, depth + 1) };
+            if !rows.is_empty() {
+                return rows;
             }
+        }
         if !unsafe { responds_to_selector(value, "count") }
             || !unsafe { responds_to_selector(value, "objectAtIndex:") }
         {

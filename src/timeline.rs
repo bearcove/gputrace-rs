@@ -1226,8 +1226,7 @@ impl CounterTrackBuilder {
         if self.samples.is_empty() {
             return None;
         }
-        self.samples
-            .sort_by_key(|left| left.timestamp_ns);
+        self.samples.sort_by_key(|left| left.timestamp_ns);
         let mut min_value = f64::INFINITY;
         let mut max_value = f64::NEG_INFINITY;
         let mut total = 0.0;
