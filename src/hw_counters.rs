@@ -1136,6 +1136,7 @@ fn attribute(
     timebase_ns: f64,
     out: &mut Accums,
 ) {
+    let guard = attribution_guard_ticks();
     let mut next = 0;
     let mut active = Vec::<Activity>::new();
     for sample in 1..stream.ends.len() {
@@ -1143,39 +1144,50 @@ fn attribute(
         if end <= start {
             continue;
         }
-        while next < activity.len() && activity[next].start < end {
+        while next < activity.len() && activity[next].start.saturating_sub(guard) < end {
             active.push(activity[next]);
             next += 1;
         }
         active.retain(|item| item.end > start);
 
-        let kick_overlap = kicks
+        // Counts are shared over windows that start `guard` early (launch
+        // events land just before the traced start); time is credited for
+        // the true overlap only.
+        let kick_presence = kicks
             .iter()
             .enumerate()
             .filter_map(|(index, kick)| {
-                let ticks = overlap(start, end, kick.start, kick.end);
+                let ticks = overlap(start, end, kick.start.saturating_sub(guard), kick.end);
                 (ticks > 0).then_some((index, ticks))
             })
             .collect::<BTreeMap<_, _>>();
-        if kick_overlap.is_empty() {
+        if kick_presence.is_empty() {
             continue;
         }
+        let kick_overlap = kick_presence
+            .keys()
+            .map(|index| {
+                let kick = &kicks[*index];
+                (*index, overlap(start, end, kick.start, kick.end))
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut residency = BTreeMap::<usize, u64>::new();
-        let mut by_dispatch = BTreeMap::<(usize, usize), Vec<(u64, u64)>>::new();
+        let mut by_dispatch = BTreeMap::<(usize, usize), (u64, Vec<(u64, u64)>)>::new();
         for item in &active {
-            if !kick_overlap.contains_key(&item.kick) {
+            if !kick_presence.contains_key(&item.kick) {
                 continue;
             }
-            let ticks = overlap(start, end, item.start, item.end);
+            let ticks = overlap(start, end, item.start.saturating_sub(guard), item.end);
             if ticks == 0 {
                 continue;
             }
             *residency.entry(item.kick).or_default() += ticks;
             if let Some(dispatch) = item.dispatch {
-                by_dispatch
-                    .entry((item.kick, dispatch))
-                    .or_default()
-                    .push((item.start.max(start), item.end.min(end)));
+                let entry = by_dispatch.entry((item.kick, dispatch)).or_default();
+                entry.0 += ticks;
+                if overlap(start, end, item.start, item.end) > 0 {
+                    entry.1.push((item.start.max(start), item.end.min(end)));
+                }
             }
         }
         let total_residency = residency.values().sum::<u64>();
@@ -1185,8 +1197,8 @@ fn attribute(
                 .map(|(kick, ticks)| (*kick, *ticks as f64 / total_residency as f64))
                 .collect::<BTreeMap<_, _>>()
         } else {
-            let total = kick_overlap.values().sum::<u64>() as f64;
-            kick_overlap
+            let total = kick_presence.values().sum::<u64>() as f64;
+            kick_presence
                 .iter()
                 .map(|(kick, ticks)| (*kick, *ticks as f64 / total))
                 .collect()
@@ -1211,12 +1223,11 @@ fn attribute(
             if kick_residency == 0 {
                 continue;
             }
-            for ((owner_kick, dispatch), intervals) in &by_dispatch {
+            for ((owner_kick, dispatch), (resident, intervals)) in &by_dispatch {
                 if owner_kick != kick {
                     continue;
                 }
-                let resident = intervals.iter().map(|(a, b)| b - a).sum::<u64>();
-                let dispatch_share = share * resident as f64 / kick_residency as f64;
+                let dispatch_share = share * *resident as f64 / kick_residency as f64;
                 let accum = out.dispatches.entry(*dispatch).or_default();
                 accum.add_counts(stream, sample, dispatch_share, shared_dispatches);
                 let busy = merge_intervals(intervals.clone())
@@ -1228,6 +1239,18 @@ fn attribute(
         }
     }
 }
+
+/// How early (in profile ticks) a sample may start before a kick or clique
+/// and still be charged to it. `GPUTRACE_HW_GUARD_TICKS` overrides it for
+/// experiments.
+fn attribution_guard_ticks() -> u64 {
+    std::env::var("GPUTRACE_HW_GUARD_TICKS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_GUARD_TICKS)
+}
+
+const DEFAULT_GUARD_TICKS: u64 = 64;
 
 fn merge_intervals(mut intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     intervals.retain(|(start, end)| end > start);
