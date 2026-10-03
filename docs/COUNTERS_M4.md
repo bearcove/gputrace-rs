@@ -140,7 +140,7 @@ hw-counters`):
 |---|---|---|
 | copy: DRAM bytes read | 67,108,864 | 6.7128e7–6.7132e7 (+0.03 %) |
 | copy: DRAM bytes written | 67,108,864 | 6.5587e7–6.5835e7 (−1.9 … −2.3 %) |
-| copy: threads | 4,194,304 | 4,194,304 (one replay 4,166,300) |
+| copy: threads | 4,194,304 | 4,194,304 (3 replays), 4.1663e6 (1) |
 | copy: DRAM read + write bandwidth | | 93–96 GB/s of 119.5 peak |
 | read: DRAM bytes read | 67,108,864 | 6.7122e7–6.7124e7 (+0.02 %) |
 | read: DRAM bytes written | 1,048,576 | 0.49–0.60 M |
@@ -207,7 +207,7 @@ expected bytes again.
   counters see write-backs, not stores. Small write volumes are not
   meaningful.
 - **Not oracle-checked:** the L1/L2/MMU limiters, L2 and buffer L1
-  bandwidths, the instruction issue and launch limiters, F16 counters. They
+  bandwidths, the instruction issue limiter, F16 counters. They
   are agxps' formulas on correctly attributed raw counts, but no kernel with a
   known answer has pinned them.
 - **Concurrent dispatches.** Per-dispatch values for dispatches that overlap
