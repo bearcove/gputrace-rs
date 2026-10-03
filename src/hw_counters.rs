@@ -952,10 +952,10 @@ fn derive_into<K: Ord + Clone>(
 /// A work clique's `esl_index` indexes the commands the timing analyzer
 /// reports for this USC (one per dispatch that ran on it, in order); the
 /// command's shader-launch program address names the dispatch. Clique ends are not traced in the
-/// limiter pass: a missing end is the next start on the same slot (a real
-/// hand-over) or, when the slot went idle, the end of the trace. Idle-slot
-/// ends are replaced by the median observed duration of the same dispatch
-/// (or of the kick) on this USC.
+/// limiter pass: a missing end is the next start on the same slot or the
+/// end of the trace. Only hand-overs between cliques of the same command are
+/// trusted as durations; every other end is capped at that command's median
+/// measured duration on this USC, or at the next command's start.
 #[cfg(target_os = "macos")]
 fn usc_activity(
     profile: &agxps_sys::counters::ApsCounterProfile,
@@ -963,60 +963,89 @@ fn usc_activity(
     dispatch_of_esl: &BTreeMap<(u64, u64), usize>,
 ) -> Vec<Activity> {
     let cliques = &profile.work_cliques;
+    // Owner of a clique: (kick index, command index on this USC).
+    let owners = cliques
+        .iter()
+        .map(|clique| {
+            let kick = clique.kick_index as usize;
+            let command_index = usize::try_from(clique.esl_index).ok()?;
+            let command = profile.commands.get(command_index)?;
+            (command.software_id == kicks.get(kick)?.software_id).then_some((kick, command_index))
+        })
+        .collect::<Vec<_>>();
+
+    // A missing end is a measured duration only when the slot was handed
+    // straight to another clique of the same command (steady state). A hand-
+    // over to a different command may follow an idle gap, and an end that is
+    // nobody's start is the end of the trace.
     let mut order = (0..cliques.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| (cliques[*index].slot, cliques[*index].start_ticks));
-    let mut handed_over = vec![false; cliques.len()];
+    let mut measured = cliques
+        .iter()
+        .map(|clique| !clique.missing_end)
+        .collect::<Vec<_>>();
     for pair in order.windows(2) {
         let (this, next) = (&cliques[pair[0]], &cliques[pair[1]]);
-        if this.slot == next.slot && this.end_ticks == next.start_ticks {
-            handed_over[pair[0]] = true;
+        if this.slot == next.slot
+            && this.end_ticks == next.start_ticks
+            && owners[pair[0]].is_some()
+            && owners[pair[0]] == owners[pair[1]]
+        {
+            measured[pair[0]] = true;
         }
     }
-    let owner = |index: usize| {
-        let clique = &cliques[index];
-        let kick = clique.kick_index as usize;
-        let kick_info = kicks.get(kick)?;
-        let command = profile.commands.get(usize::try_from(clique.esl_index).ok()?)?;
-        (command.software_id == kick_info.software_id)
-            .then_some((kick, command.esl_shader_address))
-    };
-    let mut durations_by_owner = BTreeMap::<(usize, u64), Vec<u64>>::new();
-    let mut durations_by_kick = BTreeMap::<usize, Vec<u64>>::new();
+    let mut durations = BTreeMap::<(usize, usize), Vec<u64>>::new();
     for (index, clique) in cliques.iter().enumerate() {
-        let measured = !clique.missing_end || handed_over[index];
-        if !measured || clique.end_ticks <= clique.start_ticks {
-            continue;
-        }
-        let duration = clique.end_ticks - clique.start_ticks;
-        durations_by_kick
-            .entry(clique.kick_index as usize)
-            .or_default()
-            .push(duration);
-        if let Some(key) = owner(index) {
-            durations_by_owner.entry(key).or_default().push(duration);
+        if let Some(owner) = owners[index]
+            && measured[index]
+            && clique.end_ticks > clique.start_ticks
+        {
+            durations
+                .entry(owner)
+                .or_default()
+                .push(clique.end_ticks - clique.start_ticks);
         }
     }
-    let median = |values: Option<&Vec<u64>>| {
-        values.filter(|values| !values.is_empty()).map(|values| {
-            let mut sorted = values.clone();
-            sorted.sort_unstable();
-            sorted[sorted.len() / 2]
+    let typical = durations
+        .into_iter()
+        .map(|(owner, mut values)| {
+            values.sort_unstable();
+            (owner, values[values.len() / 2])
         })
-    };
+        .collect::<BTreeMap<_, _>>();
+    // Command starts per kick, to bound cliques with no measured duration
+    // by the next command's start (dispatches of an encoder mostly run
+    // back to back behind barriers).
+    let mut starts_by_kick = BTreeMap::<u64, Vec<u64>>::new();
+    for command in &profile.commands {
+        starts_by_kick
+            .entry(command.software_id)
+            .or_default()
+            .push(command.start_ticks);
+    }
+    for starts in starts_by_kick.values_mut() {
+        starts.sort_unstable();
+    }
+
     let mut activity = Vec::with_capacity(cliques.len());
     for (index, clique) in cliques.iter().enumerate() {
         let kick = clique.kick_index as usize;
         let Some(kick_info) = kicks.get(kick) else {
             continue;
         };
-        let key = owner(index);
+        let owner = owners[index];
         let mut end = clique.end_ticks;
-        if clique.missing_end && !handed_over[index] {
-            let typical = key
-                .and_then(|key| median(durations_by_owner.get(&key)))
-                .or_else(|| median(durations_by_kick.get(&kick)));
-            if let Some(typical) = typical {
-                end = end.min(clique.start_ticks + typical);
+        if !measured[index] {
+            match owner.and_then(|owner| typical.get(&owner)) {
+                Some(duration) => end = end.min(clique.start_ticks + duration),
+                None => {
+                    if let Some(next) = starts_by_kick
+                        .get(&kick_info.software_id)
+                        .and_then(|starts| starts.iter().find(|start| **start > clique.start_ticks))
+                    {
+                        end = end.min(*next);
+                    }
+                }
             }
         }
         if kick_info.end > kick_info.start {
@@ -1025,7 +1054,8 @@ fn usc_activity(
         if end <= clique.start_ticks {
             continue;
         }
-        let dispatch = key.and_then(|(_, address)| {
+        let dispatch = owner.and_then(|(_, command_index)| {
+            let address = profile.commands[command_index].esl_shader_address;
             dispatch_of_esl
                 .get(&(kick_info.software_id >> 32, address))
                 .copied()
