@@ -559,6 +559,11 @@ struct SynthBenchArgs {
     output: PathBuf,
     #[arg(
         long,
+        help = "Capture the hardware-counter oracle (ALU, DRAM copy, DRAM read, threadgroup memory, low occupancy; one kernel per encoder) instead of the FMA-ladder workload"
+    )]
+    counter_oracle: bool,
+    #[arg(
+        long,
         value_delimiter = ',',
         help = "Comma-separated FMA loop counts per kernel"
     )]
@@ -1551,6 +1556,11 @@ pub fn run() -> Result<()> {
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-counters format")),
             }
+        }
+        CommandSet::SynthBench(args) if args.counter_oracle => {
+            let kernels = synth_bench::run_counter_oracle(&args.output)?;
+            print!("{}", synth_bench::format_counter_oracle_plan(&kernels));
+            println!("\nWrote .gputrace to {}", args.output.display());
         }
         CommandSet::SynthBench(args) => {
             let iterations = if args.iterations.is_empty() {
