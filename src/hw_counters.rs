@@ -949,9 +949,10 @@ fn derive_into<K: Ord + Clone>(
 
 /// Clique residency intervals of one USC stream, mapped to dispatches.
 ///
-/// A work clique's `esl_index` indexes the commands the timing analyzer
-/// reports for this USC (one per dispatch that ran on it, in order); the
-/// command's shader-launch program address names the dispatch. Clique ends are not traced in the
+/// Work cliques name their dispatch by `esl_index`, a running index of the
+/// shader-launch programs seen on this USC; the timing analyzer reports the
+/// program address per command (see [`match_commands`]), and the address
+/// names the dispatch. Clique ends are not traced in the
 /// limiter pass: a missing end is the next start on the same slot or the
 /// end of the trace. Only hand-overs between cliques of the same command are
 /// trusted as durations; every other end is capped at that command's median
@@ -963,14 +964,13 @@ fn usc_activity(
     dispatch_of_esl: &BTreeMap<(u64, u64), usize>,
 ) -> Vec<Activity> {
     let cliques = &profile.work_cliques;
+    let command_of_esl = match_commands(profile, kicks);
     // Owner of a clique: (kick index, command index on this USC).
     let owners = cliques
         .iter()
         .map(|clique| {
-            let kick = clique.kick_index as usize;
-            let command_index = usize::try_from(clique.esl_index).ok()?;
-            let command = profile.commands.get(command_index)?;
-            (command.software_id == kicks.get(kick)?.software_id).then_some((kick, command_index))
+            let command = *command_of_esl.get(&clique.esl_index)?;
+            Some((clique.kick_index as usize, command))
         })
         .collect::<Vec<_>>();
 
@@ -1069,6 +1069,53 @@ fn usc_activity(
     }
     activity.sort_by_key(|item| item.start);
     activity
+}
+
+/// Pair each `esl_index` of a USC stream with the timing-analyzer command it
+/// belongs to. The analyzer drops some commands (and the stream interleaves
+/// other processes' kicks), so positions do not line up: within a kick, each
+/// command takes the unclaimed clique group whose first clique starts
+/// closest to the command's start.
+#[cfg(target_os = "macos")]
+fn match_commands(
+    profile: &agxps_sys::counters::ApsCounterProfile,
+    kicks: &[Kick],
+) -> BTreeMap<u64, usize> {
+    // esl_index -> (software id, first clique start)
+    let mut groups = BTreeMap::<u64, (u64, u64)>::new();
+    for clique in &profile.work_cliques {
+        let Some(kick) = kicks.get(clique.kick_index as usize) else {
+            continue;
+        };
+        let group = groups
+            .entry(clique.esl_index)
+            .or_insert((kick.software_id, clique.start_ticks));
+        group.1 = group.1.min(clique.start_ticks);
+    }
+    let mut by_kick = BTreeMap::<u64, Vec<(u64, u64)>>::new();
+    for (esl, (software_id, first)) in &groups {
+        by_kick.entry(*software_id).or_default().push((*first, *esl));
+    }
+    let mut out = BTreeMap::new();
+    let mut order = (0..profile.commands.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| profile.commands[*index].start_ticks);
+    for index in order {
+        let command = &profile.commands[index];
+        let Some(candidates) = by_kick.get_mut(&command.software_id) else {
+            continue;
+        };
+        let Some(best) = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (first, _))| first.abs_diff(command.start_ticks))
+            .map(|(position, _)| position)
+        else {
+            continue;
+        };
+        let (_, esl) = candidates.remove(best);
+        out.insert(esl, index);
+    }
+    out
 }
 
 /// Attribute each sample of `stream` to the kicks, encoders and dispatches
