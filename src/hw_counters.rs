@@ -949,9 +949,9 @@ fn derive_into<K: Ord + Clone>(
 
 /// Clique residency intervals of one USC stream, mapped to dispatches.
 ///
-/// Work clique `esl_index` n of a kick is the n-th command the timing
-/// analyzer reports for that kick on this USC; the command's shader-launch
-/// program address names the dispatch. Clique ends are not traced in the
+/// A work clique's `esl_index` indexes the commands the timing analyzer
+/// reports for this USC (one per dispatch that ran on it, in order); the
+/// command's shader-launch program address names the dispatch. Clique ends are not traced in the
 /// limiter pass: a missing end is the next start on the same slot (a real
 /// hand-over) or, when the slot went idle, the end of the trace. Idle-slot
 /// ends are replaced by the median observed duration of the same dispatch
@@ -962,13 +962,6 @@ fn usc_activity(
     kicks: &[Kick],
     dispatch_of_esl: &BTreeMap<(u64, u64), usize>,
 ) -> Vec<Activity> {
-    let mut commands = BTreeMap::<u64, Vec<u64>>::new();
-    for command in &profile.commands {
-        commands
-            .entry(command.software_id)
-            .or_default()
-            .push(command.esl_shader_address);
-    }
     let cliques = &profile.work_cliques;
     let mut order = (0..cliques.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| (cliques[*index].slot, cliques[*index].start_ticks));
@@ -983,10 +976,9 @@ fn usc_activity(
         let clique = &cliques[index];
         let kick = clique.kick_index as usize;
         let kick_info = kicks.get(kick)?;
-        let address = *commands
-            .get(&kick_info.software_id)?
-            .get(clique.esl_index as usize)?;
-        Some((kick, address))
+        let command = profile.commands.get(usize::try_from(clique.esl_index).ok()?)?;
+        (command.software_id == kick_info.software_id)
+            .then_some((kick, command.esl_shader_address))
     };
     let mut durations_by_owner = BTreeMap::<(usize, u64), Vec<u64>>::new();
     let mut durations_by_kick = BTreeMap::<usize, Vec<u64>>::new();

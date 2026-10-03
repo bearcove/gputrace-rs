@@ -145,8 +145,7 @@ pub struct ApsCounterProfile {
     /// to kicks by index into this list).
     pub kicks: Vec<ApsKick>,
     /// Commands (dispatches) the timing analyzer found on this USC, in its
-    /// order. Within one kick, the n-th command is the work clique `esl_id`
-    /// n.
+    /// order; a work clique's `esl_index` indexes this list.
     pub commands: Vec<ApsCommand>,
     pub work_cliques: Vec<ApsWorkClique>,
 }
