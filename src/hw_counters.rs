@@ -297,7 +297,13 @@ pub struct HwCounterRow {
     pub encoder_index: Option<usize>,
     /// `drawCallIndex` of the dispatch in the capture.
     pub dispatch_index: Option<usize>,
+    /// Dispatches with counts of their own: the ones the timing analyzer
+    /// saw run (see `capture_dispatches`).
     pub dispatches: usize,
+    /// Dispatches of this row in the capture. Work of a dispatch the analyzer
+    /// did not report is credited to the dispatch that started before it on
+    /// the same core.
+    pub capture_dispatches: usize,
     /// Wall time: kick time for encoders, union of the clique intervals for
     /// dispatches and kernels.
     pub gpu_time_ns: f64,
@@ -1083,6 +1089,10 @@ pub fn report_for_profiler_dir(
                 .values()
                 .filter(|info| info.encoder == *encoder_index)
                 .count(),
+            capture_dispatches: dispatch_info
+                .values()
+                .filter(|info| info.encoder == *encoder_index)
+                .count(),
             gpu_time_ns: span_ns(&spans),
             foreign_overlap: foreign_fraction(&spans),
             shared: shared_of(usc_accums.encoders.get(encoder_index)),
@@ -1107,6 +1117,7 @@ pub fn report_for_profiler_dir(
             encoder_index: dispatch_info.get(&dispatch).map(|info| info.encoder),
             dispatch_index: Some(dispatch),
             dispatches: 1,
+            capture_dispatches: 1,
             gpu_time_ns: span_ns(&spans),
             foreign_overlap: foreign_fraction(&spans),
             shared: shared_of(usc_accums.dispatches.get(&dispatch)),
@@ -1114,6 +1125,17 @@ pub fn report_for_profiler_dir(
         });
     }
     let usc_kernels = kernel_accums(&usc_accums);
+    let mut kernel_capture_dispatches = BTreeMap::<String, usize>::new();
+    for dispatch in dispatch_info.keys() {
+        *kernel_capture_dispatches.entry(kernel_key(*dispatch)).or_default() += 1;
+    }
+    if dispatches.len() < dispatch_info.len() {
+        warnings.push(format!(
+            "the timing analyzer reported {} of {} dispatches; the work of the others is credited to the dispatch that started before them on the same core (see disp: reported/total)",
+            dispatches.len(),
+            dispatch_info.len()
+        ));
+    }
     let mut kernels = kernel_values
         .into_iter()
         .map(|(kernel, values)| {
@@ -1122,6 +1144,7 @@ pub fn report_for_profiler_dir(
                 encoder_index: None,
                 dispatch_index: None,
                 dispatches: kernel_dispatches.get(&kernel).copied().unwrap_or(0),
+                capture_dispatches: kernel_capture_dispatches.get(&kernel).copied().unwrap_or(0),
                 gpu_time_ns: span_ns(&spans),
                 foreign_overlap: foreign_fraction(&spans),
                 shared: shared_of(usc_kernels.get(&kernel)),
@@ -1821,7 +1844,7 @@ pub fn format_rows(rows: &[HwCounterRow]) -> String {
         .unwrap_or(5)
         .clamp(5, 48);
     let mut out = format!(
-        "{:<label_width$} {:>5} {:>9} {:>6} {:>6}",
+        "{:<label_width$} {:>9} {:>9} {:>6} {:>6}",
         "row", "disp", "gpu_us", "frgn%", "shrd%"
     );
     for spec in METRICS {
@@ -1831,10 +1854,15 @@ pub fn format_rows(rows: &[HwCounterRow]) -> String {
     for row in rows {
         let mut label = row_label(row);
         label.truncate(label_width);
+        let dispatches = if row.capture_dispatches > row.dispatches {
+            format!("{}/{}", row.dispatches, row.capture_dispatches)
+        } else {
+            row.dispatches.to_string()
+        };
         out.push_str(&format!(
-            "{:<label_width$} {:>5} {:>9.1} {:>6.1} {:>6.1}",
+            "{:<label_width$} {:>9} {:>9.1} {:>6.1} {:>6.1}",
             label,
-            row.dispatches,
+            dispatches,
             row.gpu_time_ns / 1000.0,
             row.foreign_overlap * 100.0,
             row.shared * 100.0
