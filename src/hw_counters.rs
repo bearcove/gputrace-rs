@@ -110,9 +110,13 @@ pub struct HwCounterReport {
     pub usc_count_period_cycles: u64,
     pub usc_streams: usize,
     pub global_sample_period_ns: f64,
-    pub encoders: Vec<HwEncoderCounters>,
+    pub encoders: Vec<HwCounterRow>,
+    pub dispatches: Vec<HwCounterRow>,
+    /// One row per kernel: per-dispatch raw counts summed by kernel name
+    /// (or by kernel program address when no names are known).
+    pub kernels: Vec<HwCounterRow>,
     /// Kicks in the limiter pass that belong to no encoder of this capture
-    /// (other processes sharing the GPU).
+    /// (other processes, or replayer-internal work).
     pub foreign_kicks: usize,
     pub warnings: Vec<String>,
 }
@@ -127,29 +131,42 @@ pub struct HwGpu {
     pub peak_dram_gbps: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct HwEncoderCounters {
-    /// Encoder index in capture order (`TraceId to BatchId`).
-    pub encoder_index: usize,
-    pub trace_id: u32,
-    pub kicks: usize,
-    /// Sum of this encoder's kick durations in the limiter pass.
+#[derive(Debug, Clone, Default)]
+pub struct HwCounterRow {
+    pub label: String,
+    pub encoder_index: Option<usize>,
+    /// `drawCallIndex` of the dispatch in the capture.
+    pub dispatch_index: Option<usize>,
+    pub dispatches: usize,
+    /// Wall time: kick time for encoders, union of the clique intervals for
+    /// dispatches and kernels.
     pub gpu_time_ns: f64,
-    /// Fraction of `gpu_time_ns` during which a kick from another process
-    /// was also running. Counters are GPU-wide or per-core, not per-process,
-    /// so anything above a few percent makes the row unreliable.
+    /// Fraction of the row's time during which a kick that is not part of
+    /// this capture was also running. Counters are GPU-wide or per core, not
+    /// per process, so a large value makes the row unreliable.
     pub foreign_overlap: f64,
+    /// Fraction of the row's counts taken from samples it shared with other
+    /// rows of the same kind (split by clique time). 0 means every sample was
+    /// exclusively this row's.
+    pub shared: f64,
     /// agxps derived counter name -> value in agxps units.
     pub values: BTreeMap<String, f64>,
 }
 
-impl HwEncoderCounters {
+impl HwCounterRow {
     pub fn metric(&self, spec: &MetricSpec) -> Option<f64> {
         self.values
             .get(spec.name)
             .copied()
             .filter(|value| value.is_finite())
             .map(|value| spec.unit.display_value(value))
+    }
+
+    pub fn metric_named(&self, name: &str) -> Option<f64> {
+        METRICS
+            .iter()
+            .find(|spec| spec.name == name)
+            .and_then(|spec| self.metric(spec))
     }
 }
 
@@ -158,7 +175,18 @@ impl HwEncoderCounters {
 struct Kick {
     start: u64,
     end: u64,
+    software_id: u64,
     encoder: Option<usize>,
+}
+
+/// One clique interval: when a dispatch's work was resident on a USC.
+#[derive(Debug, Clone, Copy)]
+struct Activity {
+    start: u64,
+    end: u64,
+    /// Index into the kick list of the stream being attributed.
+    kick: usize,
+    dispatch: Option<usize>,
 }
 
 /// One time-sampled counter stream.
@@ -171,12 +199,83 @@ struct SampleStream {
     names: Vec<String>,
 }
 
-/// Per-encoder accumulation for one counter family.
 #[derive(Default, Clone)]
-struct EncoderAccum {
+struct Accum {
     raw: BTreeMap<String, f64>,
     cycles: f64,
     seconds: f64,
+    weight: f64,
+    shared_weight: f64,
+}
+
+impl Accum {
+    fn add_counts(&mut self, stream: &SampleStream, sample: usize, share: f64, shared: bool) {
+        for (name, column) in stream.names.iter().zip(&stream.values) {
+            if let Some(value) = column.get(sample) {
+                *self.raw.entry(name.clone()).or_default() += *value as f64 * share;
+            }
+        }
+        self.weight += share;
+        if shared {
+            self.shared_weight += share;
+        }
+    }
+
+    fn add_time(&mut self, cycles: f64, seconds: f64) {
+        self.cycles += cycles;
+        self.seconds += seconds;
+    }
+
+    fn merge(&mut self, other: &Accum) {
+        for (name, value) in &other.raw {
+            *self.raw.entry(name.clone()).or_default() += value;
+        }
+        self.cycles += other.cycles;
+        self.seconds += other.seconds;
+        self.weight += other.weight;
+        self.shared_weight += other.shared_weight;
+    }
+
+    fn scale_time(&mut self, factor: f64) {
+        self.cycles *= factor;
+        self.seconds *= factor;
+    }
+}
+
+#[derive(Default, Clone)]
+struct Accums {
+    encoders: BTreeMap<usize, Accum>,
+    dispatches: BTreeMap<usize, Accum>,
+}
+
+impl Accums {
+    fn merge_counts(&mut self, other: &Accums, take_time: bool) {
+        for (target, source) in [
+            (&mut self.encoders, &other.encoders),
+            (&mut self.dispatches, &other.dispatches),
+        ] {
+            for (key, accum) in source {
+                let entry = target.entry(*key).or_default();
+                for (name, value) in &accum.raw {
+                    *entry.raw.entry(name.clone()).or_default() += value;
+                }
+                if take_time {
+                    entry.cycles += accum.cycles;
+                    entry.seconds += accum.seconds;
+                    entry.weight += accum.weight;
+                    entry.shared_weight += accum.shared_weight;
+                }
+            }
+        }
+    }
+}
+
+/// A dispatch as `Program Address Mappings` describes it.
+#[derive(Debug, Clone, Copy)]
+struct DispatchInfo {
+    encoder: usize,
+    /// Address of the kernel program, shared by every dispatch of a pipeline.
+    kernel_address: Option<u64>,
 }
 
 pub fn report(trace: &TraceBundle) -> Result<HwCounterReport> {
@@ -186,16 +285,34 @@ pub fn report(trace: &TraceBundle) -> Result<HwCounterReport> {
             trace.path.display()
         ))
     })?;
-    report_for_profiler_dir(&profiler_dir)
+    let names = profiler::stream_data_summary(&trace.path)
+        .map(|summary| dispatch_names(&summary))
+        .unwrap_or_default();
+    report_for_profiler_dir(&profiler_dir, &names)
+}
+
+/// Kernel name of every dispatch, keyed by its index in the capture.
+pub fn dispatch_names(summary: &profiler::ProfilerStreamDataSummary) -> BTreeMap<usize, String> {
+    summary
+        .dispatches
+        .iter()
+        .filter_map(|dispatch| Some((dispatch.index, dispatch.function_name.clone()?)))
+        .collect()
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn report_for_profiler_dir(_profiler_dir: &Path) -> Result<HwCounterReport> {
+pub fn report_for_profiler_dir(
+    _profiler_dir: &Path,
+    _dispatch_names: &BTreeMap<usize, String>,
+) -> Result<HwCounterReport> {
     Err(Error::Unsupported("hardware counters require macOS and Xcode"))
 }
 
 #[cfg(target_os = "macos")]
-pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
+pub fn report_for_profiler_dir(
+    profiler_dir: &Path,
+    dispatch_names: &BTreeMap<usize, String>,
+) -> Result<HwCounterReport> {
     use agxps_sys::counters::{ApsParseSettings, counter_api};
 
     let stream_data = fs::read(profiler_dir.join("streamData"))?;
@@ -247,6 +364,14 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
     let gpu = api
         .gpu(generation, shape.variant)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    tracing::debug!(
+        gpu_type,
+        generation,
+        variant = shape.variant,
+        num_cores,
+        num_mgpus,
+        "hw counters: agxps gpu"
+    );
 
     let timebase_ns = metadata
         .get("Timebase")
@@ -282,10 +407,52 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
         })
         .filter(|map| !map.is_empty())
         .ok_or_else(|| Error::InvalidInput("profile has no TraceId to BatchId map".to_owned()))?;
-    let trace_of_encoder = encoder_of_trace
-        .iter()
-        .map(|(trace_id, encoder)| (*encoder, *trace_id as u32))
-        .collect::<BTreeMap<_, _>>();
+    let encoder_for = |software_id: u64| encoder_of_trace.get(&(software_id >> 32)).copied();
+
+    // --- Dispatches: (encoder trace id, shader-launch program) -> dispatch. ---
+    let mut dispatch_of_esl = BTreeMap::<(u64, u64), usize>::new();
+    let mut dispatch_info = BTreeMap::<usize, DispatchInfo>::new();
+    for mapping in metadata
+        .get("Program Address Mappings")
+        .and_then(ArchiveValue::as_array)
+        .unwrap_or(&[])
+    {
+        let field = |key: &str| mapping.get(key).and_then(ArchiveValue::as_u64);
+        let (Some(kind), Some(encoder_trace), Some(address), Some(dispatch)) = (
+            mapping.get("type").and_then(ArchiveValue::as_str),
+            field("encID"),
+            field("mappedAddress"),
+            field("drawCallIndex"),
+        ) else {
+            continue;
+        };
+        let dispatch = dispatch as usize;
+        let Some(encoder) = encoder_of_trace.get(&encoder_trace).copied() else {
+            continue;
+        };
+        match kind {
+            "compute-sl" => {
+                dispatch_of_esl.insert((encoder_trace, address), dispatch);
+                dispatch_info
+                    .entry(dispatch)
+                    .or_insert(DispatchInfo {
+                        encoder,
+                        kernel_address: None,
+                    })
+                    .encoder = encoder;
+            }
+            "compute" => {
+                dispatch_info
+                    .entry(dispatch)
+                    .or_insert(DispatchInfo {
+                        encoder,
+                        kernel_address: None,
+                    })
+                    .kernel_address = Some(address);
+            }
+            _ => {}
+        }
+    }
 
     // --- Limiter pass, GPU-global sources (absolute ticks). ---
     let list_map = limiter
@@ -306,7 +473,7 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
             .unwrap_or_default()
     };
     let mut global_streams = BTreeMap::<(String, u64), SampleStream>::new();
-    let mut firmware_kicks = Vec::<(u64, u64, u64)>::new();
+    let mut global_kicks = Vec::<Kick>::new();
     for entry in &entries {
         let (Some(source), Some(blob)) = (
             entry.get("Source").and_then(ArchiveValue::as_str),
@@ -321,11 +488,18 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
         let names = names_for(source);
         let records = gprw_records(blob, 8 + names.len());
         if source == "Firmware" {
-            // Firmware records: [.., encoder id, kick id, .., start/end].
+            // [magic, ts, cycles, type, encoder id, kick id, slot, source,
+            //  kick end, kick start] for every finished kick.
             for record in records {
                 if record.len() >= 10 && record[3] == 5 {
                     let (a, b) = (record[8], record[9]);
-                    firmware_kicks.push((record[4], a.min(b), a.max(b)));
+                    let software_id = (record[4] << 32) | (record[5] & 0xffff_ffff);
+                    global_kicks.push(Kick {
+                        start: a.min(b),
+                        end: a.max(b),
+                        software_id,
+                        encoder: encoder_for(software_id),
+                    });
                 }
             }
             continue;
@@ -352,14 +526,6 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
     for stream in global_streams.values_mut() {
         sort_stream(stream);
     }
-    let global_kicks = firmware_kicks
-        .iter()
-        .map(|(encoder_trace, start, end)| Kick {
-            start: *start,
-            end: *end,
-            encoder: encoder_of_trace.get(encoder_trace).copied(),
-        })
-        .collect::<Vec<_>>();
     let global_sample_period_ns = global_streams
         .values()
         .next()
@@ -397,171 +563,285 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
         }
     }
 
-    // --- Attribute samples to encoders. ---
-    let encoder_count = encoder_of_trace.values().max().map_or(0, |max| max + 1);
-    let mut usc_accum = vec![EncoderAccum::default(); encoder_count];
-    let mut foreign_kicks = BTreeSet::new();
+    // --- Clock join: APS kicks (continuous) vs Firmware kicks (absolute). ---
+    let firmware_start = global_kicks
+        .iter()
+        .map(|kick| (kick.software_id, kick.start))
+        .collect::<BTreeMap<_, _>>();
+    let mut offsets = usc_profiles
+        .iter()
+        .flat_map(|profile| profile.kicks.iter())
+        .filter_map(|kick| {
+            let fw = *firmware_start.get(&kick.software_id)?;
+            Some(kick.start_ticks as i128 - fw as i128)
+        })
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    let continuous_minus_absolute = offsets.get(offsets.len() / 2).copied().unwrap_or_else(|| {
+        let field = |key: &str| metadata.get(key).and_then(ArchiveValue::as_i64).unwrap_or(0);
+        field("Continuous Time") as i128 - field("Absolute Time") as i128
+    });
+    let to_absolute = |ticks: u64| (ticks as i128 - continuous_minus_absolute).max(0) as u64;
+
+    // Kicks seen only by the USC streams (replayer-internal work, other
+    // processes) still compete for the same samples.
+    let mut known = global_kicks
+        .iter()
+        .map(|kick| kick.software_id)
+        .collect::<BTreeSet<_>>();
+    for profile in &usc_profiles {
+        for kick in &profile.kicks {
+            if kick.missing_end || kick.end_ticks <= kick.start_ticks {
+                continue;
+            }
+            if known.insert(kick.software_id) {
+                global_kicks.push(Kick {
+                    start: to_absolute(kick.start_ticks),
+                    end: to_absolute(kick.end_ticks),
+                    software_id: kick.software_id,
+                    encoder: encoder_for(kick.software_id),
+                });
+            }
+        }
+    }
+    let global_kick_of = global_kicks
+        .iter()
+        .enumerate()
+        .map(|(index, kick)| (kick.software_id, index))
+        .collect::<BTreeMap<_, _>>();
+
+    // --- Per-USC attribution, weighted by clique residency. ---
+    let mut usc_accums = Accums::default();
+    let mut global_activity = Vec::<Activity>::new();
+    let mut unmapped_cliques = 0usize;
+    let mut mapped_cliques = 0usize;
     for profile in &usc_profiles {
         let kicks = profile
             .kicks
             .iter()
-            .filter(|kick| !kick.missing_end && kick.end_ticks > kick.start_ticks)
-            .map(|kick| {
-                let encoder = encoder_of_trace.get(&(kick.software_id >> 32)).copied();
-                if encoder.is_none() {
-                    foreign_kicks.insert(kick.software_id);
-                }
-                Kick {
-                    start: kick.start_ticks,
-                    end: kick.end_ticks,
-                    encoder,
-                }
+            .map(|kick| Kick {
+                start: kick.start_ticks,
+                end: if kick.missing_end {
+                    kick.start_ticks
+                } else {
+                    kick.end_ticks
+                },
+                software_id: kick.software_id,
+                encoder: encoder_for(kick.software_id),
             })
             .collect::<Vec<_>>();
+        let activity = usc_activity(profile, &kicks, &dispatch_of_esl);
+        for item in &activity {
+            if item.dispatch.is_some() {
+                mapped_cliques += 1;
+            } else if kicks[item.kick].encoder.is_some() {
+                unmapped_cliques += 1;
+            }
+            if let Some(global) = global_kick_of.get(&kicks[item.kick].software_id) {
+                global_activity.push(Activity {
+                    start: to_absolute(item.start),
+                    end: to_absolute(item.end),
+                    kick: *global,
+                    dispatch: item.dispatch,
+                });
+            }
+        }
         let stream = SampleStream {
             ends: profile.sample_end_ticks.clone(),
             cycles: profile.sample_cycles.clone(),
             values: profile.values.clone(),
             names: profile.counter_names.clone(),
         };
-        attribute(&stream, &kicks, timebase_ns, &mut usc_accum);
+        attribute(&stream, &kicks, &activity, timebase_ns, &mut usc_accums);
     }
-    let usc_streams = usc_profiles.len().max(1) as f64;
-    for accum in &mut usc_accum {
-        // Raw counts add up across cores; cycles and time are per core.
-        accum.cycles /= usc_streams;
-        accum.seconds /= usc_streams;
+    if unmapped_cliques > 0 {
+        warnings.push(format!(
+            "{unmapped_cliques} of {} work cliques of this capture's kicks matched no dispatch",
+            unmapped_cliques + mapped_cliques
+        ));
     }
-    // One family per GPU-global source: its rings are instances of the same
-    // block (raw counts add up) and its own cycle column is the clock its
-    // formulas expect.
-    let mut global_accums = BTreeMap::<String, Vec<EncoderAccum>>::new();
-    for ((source, _ring), stream) in &global_streams {
-        let mut accum = vec![EncoderAccum::default(); encoder_count];
-        attribute(stream, &global_kicks, timebase_ns, &mut accum);
-        let family = global_accums
+    // Raw counts add up across cores; cycles and time are per core.
+    let core_scale = 1.0 / usc_profiles.len().max(1) as f64;
+    for accum in usc_accums
+        .encoders
+        .values_mut()
+        .chain(usc_accums.dispatches.values_mut())
+    {
+        accum.scale_time(core_scale);
+    }
+
+    // --- GPU-global attribution: one family per source; rings are instances
+    // of the same block (counts add), ring 0 carries the clock. ---
+    global_activity.sort_by_key(|item| item.start);
+    let mut global_families = BTreeMap::<String, Accums>::new();
+    for ((source, ring), stream) in &global_streams {
+        let mut accums = Accums::default();
+        attribute(stream, &global_kicks, &global_activity, timebase_ns, &mut accums);
+        // BTreeMap order visits each source's lowest ring first.
+        let take_time = !global_families.contains_key(source);
+        tracing::trace!(source, ring, take_time, "hw counters: global stream");
+        global_families
             .entry(source.clone())
-            .or_insert_with(|| vec![EncoderAccum::default(); encoder_count]);
-        for (total, part) in family.iter_mut().zip(accum) {
-            for (name, value) in part.raw {
-                *total.raw.entry(name).or_default() += value;
-            }
-            if total.seconds == 0.0 {
-                total.cycles = part.cycles;
-                total.seconds = part.seconds;
-            }
-        }
+            .or_default()
+            .merge_counts(&accums, take_time);
     }
 
-    // --- Derived counters, one call per counter family. ---
+    // --- Kernels: dispatch accumulations summed by kernel. ---
+    let kernel_key = |dispatch: usize| -> String {
+        dispatch_names.get(&dispatch).cloned().unwrap_or_else(|| {
+            match dispatch_info.get(&dispatch).and_then(|info| info.kernel_address) {
+                Some(address) => format!("kernel@{address:#x}"),
+                None => format!("dispatch {dispatch}"),
+            }
+        })
+    };
+    let kernel_accums = |accums: &Accums| -> BTreeMap<String, Accum> {
+        let mut out = BTreeMap::<String, Accum>::new();
+        for (dispatch, accum) in &accums.dispatches {
+            out.entry(kernel_key(*dispatch)).or_default().merge(accum);
+        }
+        out
+    };
+
+    // --- Derived counters per family, for every row kind. ---
     let derived = gpu.derived_counters();
-    let mut values = vec![BTreeMap::<String, f64>::new(); encoder_count];
-    for accum in std::iter::once(&usc_accum).chain(global_accums.values()) {
-        let raw_names = accum
-            .iter()
-            .flat_map(|encoder| encoder.raw.keys().cloned())
-            .collect::<BTreeSet<_>>();
-        let raw_idents = raw_names
-            .iter()
-            .filter_map(|name| Some((gpu.ident(name)?, name.clone())))
-            .collect::<Vec<_>>();
-        let available = raw_idents
-            .iter()
-            .map(|(ident, _)| *ident)
-            .collect::<BTreeSet<_>>();
-        let computable = derived
-            .iter()
-            .copied()
-            .filter(|ident| {
-                let deps = gpu.raw_dependencies(&[*ident]);
-                !deps.is_empty() && deps.iter().all(|dep| available.contains(dep))
-            })
-            .collect::<Vec<_>>();
-        if computable.is_empty() {
-            continue;
-        }
-        let raw = raw_idents
-            .iter()
-            .map(|(ident, name)| {
-                (
-                    *ident,
-                    accum
-                        .iter()
-                        .map(|encoder| encoder.raw.get(name).copied().unwrap_or(0.0).round() as u64)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let cycles = accum
-            .iter()
-            .map(|encoder| encoder.cycles.round() as u64)
-            .collect::<Vec<_>>();
-        let seconds = accum.iter().map(|encoder| encoder.seconds).collect::<Vec<_>>();
-        let results = gpu
-            .compute(&raw, &cycles, &seconds, &constants, &computable)
-            .map_err(|error| Error::InvalidInput(error.to_string()))?;
-        for (ident, series) in computable.iter().zip(results) {
-            let Some(series) = series else { continue };
-            let name = gpu.info(*ident).name;
-            for (encoder, value) in series.into_iter().enumerate() {
-                if accum[encoder].seconds > 0.0 {
-                    values[encoder].entry(name.clone()).or_insert(value);
-                }
-            }
-        }
+    let families = std::iter::once(&usc_accums)
+        .chain(global_families.values())
+        .collect::<Vec<_>>();
+    let mut encoder_values = BTreeMap::<usize, BTreeMap<String, f64>>::new();
+    let mut dispatch_values = BTreeMap::<usize, BTreeMap<String, f64>>::new();
+    let mut kernel_values = BTreeMap::<String, BTreeMap<String, f64>>::new();
+    for family in &families {
+        let kernels = kernel_accums(family);
+        derive_into(&gpu, &derived, &constants, &family.encoders, &mut encoder_values)?;
+        derive_into(&gpu, &derived, &constants, &family.dispatches, &mut dispatch_values)?;
+        derive_into(&gpu, &derived, &constants, &kernels, &mut kernel_values)?;
     }
 
-    // --- Per-encoder timing and contamination from the global kick list. ---
-    let foreign_windows = global_kicks
-        .iter()
-        .filter(|kick| kick.encoder.is_none())
-        .map(|kick| (kick.start, kick.end))
-        .collect::<Vec<_>>();
-    let mut encoders = Vec::new();
-    for (encoder_index, trace_id) in &trace_of_encoder {
-        let kicks = global_kicks
-            .iter()
-            .filter(|kick| kick.encoder == Some(*encoder_index))
-            .collect::<Vec<_>>();
-        if kicks.is_empty() && usc_accum[*encoder_index].seconds == 0.0 {
-            continue;
-        }
-        let total_ticks = kicks
-            .iter()
-            .map(|kick| kick.end - kick.start)
-            .sum::<u64>() as f64;
-        let overlap_ticks = kicks
-            .iter()
-            .map(|kick| {
-                foreign_windows
-                    .iter()
-                    .map(|(start, end)| overlap(kick.start, kick.end, *start, *end))
-                    .sum::<u64>()
-                    .min(kick.end - kick.start)
-            })
-            .sum::<u64>() as f64;
-        encoders.push(HwEncoderCounters {
-            encoder_index: *encoder_index,
-            trace_id: *trace_id,
-            kicks: kicks.len(),
-            gpu_time_ns: total_ticks * timebase_ns,
-            foreign_overlap: if total_ticks > 0.0 {
-                overlap_ticks / total_ticks
-            } else {
-                0.0
-            },
-            values: std::mem::take(&mut values[*encoder_index]),
-        });
-    }
-    let foreign_kick_count = foreign_kicks.len().max(
+    // --- Timing and contamination. ---
+    let foreign = merge_intervals(
         global_kicks
             .iter()
             .filter(|kick| kick.encoder.is_none())
-            .count(),
+            .map(|kick| (kick.start, kick.end))
+            .collect(),
     );
+    let foreign_kick_count = global_kicks
+        .iter()
+        .filter(|kick| kick.encoder.is_none())
+        .count();
+    let mut dispatch_intervals = BTreeMap::<usize, Vec<(u64, u64)>>::new();
+    for item in &global_activity {
+        if let Some(dispatch) = item.dispatch {
+            dispatch_intervals
+                .entry(dispatch)
+                .or_default()
+                .push((item.start, item.end));
+        }
+    }
+    let dispatch_spans = dispatch_intervals
+        .into_iter()
+        .map(|(dispatch, intervals)| (dispatch, merge_intervals(intervals)))
+        .collect::<BTreeMap<_, _>>();
+    let span_ns = |spans: &[(u64, u64)]| {
+        spans.iter().map(|(start, end)| end - start).sum::<u64>() as f64 * timebase_ns
+    };
+    let foreign_fraction = |spans: &[(u64, u64)]| {
+        let total = spans.iter().map(|(start, end)| end - start).sum::<u64>();
+        if total == 0 {
+            return 0.0;
+        }
+        let shared = spans
+            .iter()
+            .map(|(start, end)| {
+                foreign
+                    .iter()
+                    .map(|(f_start, f_end)| overlap(*start, *end, *f_start, *f_end))
+                    .sum::<u64>()
+            })
+            .sum::<u64>();
+        shared as f64 / total as f64
+    };
+    let shared_of = |accum: Option<&Accum>| {
+        accum
+            .filter(|accum| accum.weight > 0.0)
+            .map(|accum| accum.shared_weight / accum.weight)
+            .unwrap_or(0.0)
+    };
+
+    let mut encoders = Vec::new();
+    for (trace_id, encoder_index) in &encoder_of_trace {
+        let spans = merge_intervals(
+            global_kicks
+                .iter()
+                .filter(|kick| kick.encoder == Some(*encoder_index))
+                .map(|kick| (kick.start, kick.end))
+                .collect(),
+        );
+        let values = encoder_values.remove(encoder_index).unwrap_or_default();
+        if spans.is_empty() && values.is_empty() {
+            continue;
+        }
+        encoders.push(HwCounterRow {
+            label: format!("encoder {encoder_index} ({trace_id:#x})"),
+            encoder_index: Some(*encoder_index),
+            dispatch_index: None,
+            dispatches: dispatch_info
+                .values()
+                .filter(|info| info.encoder == *encoder_index)
+                .count(),
+            gpu_time_ns: span_ns(&spans),
+            foreign_overlap: foreign_fraction(&spans),
+            shared: shared_of(usc_accums.encoders.get(encoder_index)),
+            values,
+        });
+    }
+    encoders.sort_by_key(|row| row.encoder_index);
+
+    let mut dispatches = Vec::new();
+    let mut kernel_spans = BTreeMap::<String, Vec<(u64, u64)>>::new();
+    let mut kernel_dispatches = BTreeMap::<String, usize>::new();
+    for (dispatch, values) in dispatch_values {
+        let spans = dispatch_spans.get(&dispatch).cloned().unwrap_or_default();
+        let kernel = kernel_key(dispatch);
+        kernel_spans
+            .entry(kernel.clone())
+            .or_default()
+            .extend(spans.iter().copied());
+        *kernel_dispatches.entry(kernel.clone()).or_default() += 1;
+        dispatches.push(HwCounterRow {
+            label: kernel,
+            encoder_index: dispatch_info.get(&dispatch).map(|info| info.encoder),
+            dispatch_index: Some(dispatch),
+            dispatches: 1,
+            gpu_time_ns: span_ns(&spans),
+            foreign_overlap: foreign_fraction(&spans),
+            shared: shared_of(usc_accums.dispatches.get(&dispatch)),
+            values,
+        });
+    }
+    let usc_kernels = kernel_accums(&usc_accums);
+    let mut kernels = kernel_values
+        .into_iter()
+        .map(|(kernel, values)| {
+            let spans = merge_intervals(kernel_spans.remove(&kernel).unwrap_or_default());
+            HwCounterRow {
+                encoder_index: None,
+                dispatch_index: None,
+                dispatches: kernel_dispatches.get(&kernel).copied().unwrap_or(0),
+                gpu_time_ns: span_ns(&spans),
+                foreign_overlap: foreign_fraction(&spans),
+                shared: shared_of(usc_kernels.get(&kernel)),
+                label: kernel,
+                values,
+            }
+        })
+        .collect::<Vec<_>>();
+    kernels.sort_by(|left, right| right.gpu_time_ns.total_cmp(&left.gpu_time_ns));
+
     if foreign_kick_count > 0 {
         warnings.push(format!(
-            "{foreign_kick_count} kick(s) from other processes ran on the GPU during the counter pass; rows with foreign overlap mix their counts in"
+            "{foreign_kick_count} kick(s) not from this capture ran during the counter pass; rows with foreign overlap mix their counts in"
         ));
     }
     if usc_profiles.is_empty() {
@@ -584,9 +864,313 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
         usc_streams: usc_profiles.len(),
         global_sample_period_ns,
         encoders,
+        dispatches,
+        kernels,
         foreign_kicks: foreign_kick_count,
         warnings,
     })
+}
+
+/// Evaluate every derived counter computable from `targets`' raw counters
+/// and record the first value seen for each (target, counter).
+#[cfg(target_os = "macos")]
+fn derive_into<K: Ord + Clone>(
+    gpu: &agxps_sys::counters::CounterGpu<'_>,
+    derived: &[agxps_sys::counters::CounterIdent],
+    constants: &[(&str, f64)],
+    targets: &BTreeMap<K, Accum>,
+    out: &mut BTreeMap<K, BTreeMap<String, f64>>,
+) -> Result<()> {
+    let targets = targets
+        .iter()
+        .filter(|(_, accum)| accum.seconds > 0.0)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let raw_names = targets
+        .iter()
+        .flat_map(|(_, accum)| accum.raw.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    let raw_idents = raw_names
+        .iter()
+        .filter_map(|name| Some((gpu.ident(name)?, name.clone())))
+        .collect::<Vec<_>>();
+    let available = raw_idents
+        .iter()
+        .map(|(ident, _)| *ident)
+        .collect::<BTreeSet<_>>();
+    let computable = derived
+        .iter()
+        .copied()
+        .filter(|ident| {
+            let deps = gpu.raw_dependencies(&[*ident]);
+            !deps.is_empty() && deps.iter().all(|dep| available.contains(dep))
+        })
+        .collect::<Vec<_>>();
+    if computable.is_empty() {
+        return Ok(());
+    }
+    let raw = raw_idents
+        .iter()
+        .map(|(ident, name)| {
+            (
+                *ident,
+                targets
+                    .iter()
+                    .map(|(_, accum)| accum.raw.get(name).copied().unwrap_or(0.0).round() as u64)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let cycles = targets
+        .iter()
+        .map(|(_, accum)| accum.cycles.round() as u64)
+        .collect::<Vec<_>>();
+    let seconds = targets
+        .iter()
+        .map(|(_, accum)| accum.seconds)
+        .collect::<Vec<_>>();
+    let results = gpu
+        .compute(&raw, &cycles, &seconds, constants, &computable)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    for (ident, series) in computable.iter().zip(results) {
+        let Some(series) = series else { continue };
+        let name = gpu.info(*ident).name;
+        for ((key, _), value) in targets.iter().zip(series) {
+            out.entry((*key).clone())
+                .or_default()
+                .entry(name.clone())
+                .or_insert(value);
+        }
+    }
+    Ok(())
+}
+
+/// Clique residency intervals of one USC stream, mapped to dispatches.
+///
+/// Work clique `esl_index` n of a kick is the n-th command the timing
+/// analyzer reports for that kick on this USC; the command's shader-launch
+/// program address names the dispatch. Clique ends are not traced in the
+/// limiter pass: a missing end is the next start on the same slot (a real
+/// hand-over) or, when the slot went idle, the end of the trace. Idle-slot
+/// ends are replaced by the median observed duration of the same dispatch
+/// (or of the kick) on this USC.
+#[cfg(target_os = "macos")]
+fn usc_activity(
+    profile: &agxps_sys::counters::ApsCounterProfile,
+    kicks: &[Kick],
+    dispatch_of_esl: &BTreeMap<(u64, u64), usize>,
+) -> Vec<Activity> {
+    let mut commands = BTreeMap::<u64, Vec<u64>>::new();
+    for command in &profile.commands {
+        commands
+            .entry(command.software_id)
+            .or_default()
+            .push(command.esl_shader_address);
+    }
+    let cliques = &profile.work_cliques;
+    let mut order = (0..cliques.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| (cliques[*index].slot, cliques[*index].start_ticks));
+    let mut handed_over = vec![false; cliques.len()];
+    for pair in order.windows(2) {
+        let (this, next) = (&cliques[pair[0]], &cliques[pair[1]]);
+        if this.slot == next.slot && this.end_ticks == next.start_ticks {
+            handed_over[pair[0]] = true;
+        }
+    }
+    let owner = |index: usize| {
+        let clique = &cliques[index];
+        let kick = clique.kick_index as usize;
+        let kick_info = kicks.get(kick)?;
+        let address = *commands
+            .get(&kick_info.software_id)?
+            .get(clique.esl_index as usize)?;
+        Some((kick, address))
+    };
+    let mut durations_by_owner = BTreeMap::<(usize, u64), Vec<u64>>::new();
+    let mut durations_by_kick = BTreeMap::<usize, Vec<u64>>::new();
+    for (index, clique) in cliques.iter().enumerate() {
+        let measured = !clique.missing_end || handed_over[index];
+        if !measured || clique.end_ticks <= clique.start_ticks {
+            continue;
+        }
+        let duration = clique.end_ticks - clique.start_ticks;
+        durations_by_kick
+            .entry(clique.kick_index as usize)
+            .or_default()
+            .push(duration);
+        if let Some(key) = owner(index) {
+            durations_by_owner.entry(key).or_default().push(duration);
+        }
+    }
+    let median = |values: Option<&Vec<u64>>| {
+        values.filter(|values| !values.is_empty()).map(|values| {
+            let mut sorted = values.clone();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        })
+    };
+    let mut activity = Vec::with_capacity(cliques.len());
+    for (index, clique) in cliques.iter().enumerate() {
+        let kick = clique.kick_index as usize;
+        let Some(kick_info) = kicks.get(kick) else {
+            continue;
+        };
+        let key = owner(index);
+        let mut end = clique.end_ticks;
+        if clique.missing_end && !handed_over[index] {
+            let typical = key
+                .and_then(|key| median(durations_by_owner.get(&key)))
+                .or_else(|| median(durations_by_kick.get(&kick)));
+            if let Some(typical) = typical {
+                end = end.min(clique.start_ticks + typical);
+            }
+        }
+        if kick_info.end > kick_info.start {
+            end = end.min(kick_info.end);
+        }
+        if end <= clique.start_ticks {
+            continue;
+        }
+        let dispatch = key.and_then(|(_, address)| {
+            dispatch_of_esl
+                .get(&(kick_info.software_id >> 32, address))
+                .copied()
+        });
+        activity.push(Activity {
+            start: clique.start_ticks,
+            end,
+            kick,
+            dispatch,
+        });
+    }
+    activity.sort_by_key(|item| item.start);
+    activity
+}
+
+/// Attribute each sample of `stream` to the kicks, encoders and dispatches
+/// that were running during it.
+///
+/// Kicks overlapping a sample share it in proportion to their clique
+/// residency inside the sample (time overlap when no clique is visible):
+/// a blit or a kick idle on this core takes nothing, and the idle remainder
+/// of a sample holds no events. Within a kick, dispatches share in
+/// proportion to their own clique residency. Kicks of other processes take
+/// their share and drop it. Time is credited per row as the part of the
+/// sample the row was running (kick span for encoders, clique union for
+/// dispatches).
+fn attribute(
+    stream: &SampleStream,
+    kicks: &[Kick],
+    activity: &[Activity],
+    timebase_ns: f64,
+    out: &mut Accums,
+) {
+    let mut next = 0;
+    let mut active = Vec::<Activity>::new();
+    for sample in 1..stream.ends.len() {
+        let (start, end) = (stream.ends[sample - 1], stream.ends[sample]);
+        if end <= start {
+            continue;
+        }
+        while next < activity.len() && activity[next].start < end {
+            active.push(activity[next]);
+            next += 1;
+        }
+        active.retain(|item| item.end > start);
+
+        let kick_overlap = kicks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kick)| {
+                let ticks = overlap(start, end, kick.start, kick.end);
+                (ticks > 0).then_some((index, ticks))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if kick_overlap.is_empty() {
+            continue;
+        }
+        let mut residency = BTreeMap::<usize, u64>::new();
+        let mut by_dispatch = BTreeMap::<(usize, usize), Vec<(u64, u64)>>::new();
+        for item in &active {
+            if !kick_overlap.contains_key(&item.kick) {
+                continue;
+            }
+            let ticks = overlap(start, end, item.start, item.end);
+            if ticks == 0 {
+                continue;
+            }
+            *residency.entry(item.kick).or_default() += ticks;
+            if let Some(dispatch) = item.dispatch {
+                by_dispatch
+                    .entry((item.kick, dispatch))
+                    .or_default()
+                    .push((item.start.max(start), item.end.min(end)));
+            }
+        }
+        let total_residency = residency.values().sum::<u64>();
+        let shares = if total_residency > 0 {
+            residency
+                .iter()
+                .map(|(kick, ticks)| (*kick, *ticks as f64 / total_residency as f64))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            let total = kick_overlap.values().sum::<u64>() as f64;
+            kick_overlap
+                .iter()
+                .map(|(kick, ticks)| (*kick, *ticks as f64 / total))
+                .collect()
+        };
+        let duration = (end - start) as f64;
+        let cycles = stream.cycles.get(sample).copied().unwrap_or(0) as f64;
+        let encoders_present = shares
+            .keys()
+            .filter_map(|kick| kicks[*kick].encoder)
+            .collect::<BTreeSet<_>>();
+        let shared_encoders = encoders_present.len() > 1 || shares.len() > encoders_present.len();
+        let shared_dispatches = by_dispatch.len() > 1 || shares.len() > 1;
+        for (kick, share) in &shares {
+            let Some(encoder) = kicks[*kick].encoder else {
+                continue;
+            };
+            let accum = out.encoders.entry(encoder).or_default();
+            accum.add_counts(stream, sample, *share, shared_encoders);
+            let ticks = kick_overlap.get(kick).copied().unwrap_or(0) as f64;
+            accum.add_time(cycles * ticks / duration, ticks * timebase_ns * 1e-9);
+            let kick_residency = residency.get(kick).copied().unwrap_or(0);
+            if kick_residency == 0 {
+                continue;
+            }
+            for ((owner_kick, dispatch), intervals) in &by_dispatch {
+                if owner_kick != kick {
+                    continue;
+                }
+                let resident = intervals.iter().map(|(a, b)| b - a).sum::<u64>();
+                let dispatch_share = share * resident as f64 / kick_residency as f64;
+                let accum = out.dispatches.entry(*dispatch).or_default();
+                accum.add_counts(stream, sample, dispatch_share, shared_dispatches);
+                let busy = merge_intervals(intervals.clone())
+                    .iter()
+                    .map(|(a, b)| b - a)
+                    .sum::<u64>() as f64;
+                accum.add_time(cycles * busy / duration, busy * timebase_ns * 1e-9);
+            }
+        }
+    }
+}
+
+fn merge_intervals(mut intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    intervals.retain(|(start, end)| end > start);
+    intervals.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 /// The agxps `(generation, variant)` of the GPU a profile was recorded on:
@@ -617,48 +1201,6 @@ pub fn agxps_gpu_for_profile(profiler_dir: &Path) -> Option<(u32, u32)> {
 /// (`agxps_aps_get_uarch_behaviour_from_GRC_counter_list`).
 const UARCH_TRIGGER_COUNTER: &str =
     "_b08194796a2cb35a8699c8d23b129c582951d9d1941fbc8e36dbaafa02d474e7";
-
-/// Attribute each sample of `stream` to the encoders whose kicks overlap it.
-///
-/// A sample overlapped by a single kick goes to that kick's encoder whole:
-/// the rest of the sample was idle, so it holds no other events. A sample
-/// shared by several kicks is split in proportion to overlap time. Kicks
-/// of other processes (`encoder: None`) take their share and drop it.
-fn attribute(stream: &SampleStream, kicks: &[Kick], timebase_ns: f64, out: &mut [EncoderAccum]) {
-    for index in 1..stream.ends.len() {
-        let (start, end) = (stream.ends[index - 1], stream.ends[index]);
-        if end <= start {
-            continue;
-        }
-        let overlaps = kicks
-            .iter()
-            .filter_map(|kick| {
-                let ticks = overlap(start, end, kick.start, kick.end);
-                (ticks > 0).then_some((kick.encoder, ticks))
-            })
-            .collect::<Vec<_>>();
-        let busy = overlaps.iter().map(|(_, ticks)| *ticks).sum::<u64>();
-        if busy == 0 {
-            continue;
-        }
-        let duration = (end - start) as f64;
-        for (encoder, ticks) in overlaps {
-            let Some(encoder) = encoder else { continue };
-            let Some(accum) = out.get_mut(encoder) else {
-                continue;
-            };
-            let share = ticks as f64 / busy as f64;
-            let active = ticks as f64 / duration;
-            for (name, column) in stream.names.iter().zip(&stream.values) {
-                if let Some(value) = column.get(index) {
-                    *accum.raw.entry(name.clone()).or_default() += *value as f64 * share;
-                }
-            }
-            accum.cycles += stream.cycles.get(index).copied().unwrap_or(0) as f64 * active;
-            accum.seconds += ticks as f64 * timebase_ns * 1e-9;
-        }
-    }
-}
 
 fn overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> u64 {
     a_end.min(b_end).saturating_sub(a_start.max(b_start))
@@ -736,22 +1278,45 @@ pub fn format_report(report: &HwCounterReport) -> String {
     for warning in &report.warnings {
         out.push_str(&format!("warning: {warning}\n"));
     }
-    out.push('\n');
-    out.push_str(&format!("{:>4} {:>10} {:>9} {:>6}", "enc", "trace_id", "gpu_us", "frgn%"));
+    out.push_str("\nPer encoder (exact: samples attributed by kick):\n");
+    out.push_str(&format_rows(&report.encoders));
+    out.push_str("\nPer kernel (per-dispatch attribution summed by kernel):\n");
+    out.push_str(&format_rows(&report.kernels));
+    out.push_str("\nPer dispatch:\n");
+    out.push_str(&format_rows(&report.dispatches));
+    out
+}
+
+/// Fixed-width table of rows: label, dispatch count, time, contamination,
+/// shared-sample fraction, then every [`METRICS`] column.
+pub fn format_rows(rows: &[HwCounterRow]) -> String {
+    let label_width = rows
+        .iter()
+        .map(|row| row_label(row).len())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 48);
+    let mut out = format!(
+        "{:<label_width$} {:>5} {:>9} {:>6} {:>6}",
+        "row", "disp", "gpu_us", "frgn%", "shrd%"
+    );
     for spec in METRICS {
         out.push_str(&format!(" {:>13}", spec.label));
     }
     out.push('\n');
-    for encoder in &report.encoders {
+    for row in rows {
+        let mut label = row_label(row);
+        label.truncate(label_width);
         out.push_str(&format!(
-            "{:>4} {:>#10x} {:>9.1} {:>6.1}",
-            encoder.encoder_index,
-            encoder.trace_id,
-            encoder.gpu_time_ns / 1000.0,
-            encoder.foreign_overlap * 100.0
+            "{:<label_width$} {:>5} {:>9.1} {:>6.1} {:>6.1}",
+            label,
+            row.dispatches,
+            row.gpu_time_ns / 1000.0,
+            row.foreign_overlap * 100.0,
+            row.shared * 100.0
         ));
         for spec in METRICS {
-            match encoder.metric(spec) {
+            match row.metric(spec) {
                 Some(value) => out.push_str(&format!(" {:>13}", format_metric(spec.unit, value))),
                 None => out.push_str(&format!(" {:>13}", "-")),
             }
@@ -759,6 +1324,13 @@ pub fn format_report(report: &HwCounterReport) -> String {
         out.push('\n');
     }
     out
+}
+
+fn row_label(row: &HwCounterRow) -> String {
+    match row.dispatch_index {
+        Some(dispatch) => format!("#{dispatch} {}", row.label),
+        None => row.label.clone(),
+    }
 }
 
 pub fn format_metric(unit: MetricUnit, value: f64) -> String {
