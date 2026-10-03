@@ -765,14 +765,19 @@ fn hw_counter_insights(
     if row.gpu_time_ns < HW_INSIGHT_MIN_GPU_NS {
         return;
     }
-    let caveat = if row.foreign_overlap > 0.2 {
-        format!(
+    let mut caveat = String::new();
+    if row.foreign_overlap > 0.2 {
+        caveat.push_str(&format!(
             " Another process ran on the GPU for {:.0}% of this kernel's time, so these counts include its work.",
             row.foreign_overlap * 100.0
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
+    if row.dispatches < row.capture_dispatches {
+        caveat.push_str(&format!(
+            " Only {} of its {} dispatches were reported by the timing analyzer; its row also holds the work of unreported dispatches that started right after it (often a different kernel).",
+            row.dispatches, row.capture_dispatches
+        ));
+    }
     let top_limiter = COMPUTE_LIMITERS
         .iter()
         .filter_map(|(name, unit)| Some((*name, *unit, row.percent(name)?)))
