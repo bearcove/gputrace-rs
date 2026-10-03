@@ -374,7 +374,10 @@ pub fn cached_report_result(path: &Path) -> std::result::Result<Arc<HwCounterRep
     if let Some(hit) = cache.lock().unwrap().get(&dir) {
         return hit.clone();
     }
-    let names = profiler::stream_data_summary(&dir)
+    // From the trace path when there is one: the profile alone leaves some
+    // pipeline names empty, the trace fills them in.
+    let names = profiler::stream_data_summary(path)
+        .or_else(|_| profiler::stream_data_summary(&dir))
         .map(|summary| dispatch_names(&summary))
         .unwrap_or_default();
     let report = report_for_profiler_dir(&dir, &names)
@@ -523,7 +526,10 @@ pub fn dispatch_names(summary: &profiler::ProfilerStreamDataSummary) -> BTreeMap
     summary
         .dispatches
         .iter()
-        .filter_map(|dispatch| Some((dispatch.index, dispatch.function_name.clone()?)))
+        .filter_map(|dispatch| {
+            let name = dispatch.function_name.clone()?;
+            (!name.is_empty()).then_some((dispatch.index, name))
+        })
         .collect()
 }
 
@@ -1252,12 +1258,33 @@ fn usc_activity(
 ) -> Vec<Activity> {
     let cliques = &profile.work_cliques;
     let command_of_esl = match_commands(profile, kicks);
-    // Owner of a clique: (kick index, command index on this USC).
+    // Command starts per kick, in time order.
+    let mut starts_by_kick = BTreeMap::<u64, Vec<(u64, usize)>>::new();
+    for (index, command) in profile.commands.iter().enumerate() {
+        starts_by_kick
+            .entry(command.software_id)
+            .or_default()
+            .push((command.start_ticks, index));
+    }
+    for starts in starts_by_kick.values_mut() {
+        starts.sort_unstable();
+    }
+    // Owner of a clique: (kick index, command index on this USC). Most
+    // cliques carry no shader-launch index (`esl_index` all ones: only the
+    // first cliques of a launch are tagged), so an untagged clique belongs to
+    // the command of its kick that started last before it on this core.
+    let guard = attribution_guard_ticks();
     let owners = cliques
         .iter()
         .map(|clique| {
-            let command = *command_of_esl.get(&clique.esl_index)?;
-            Some((clique.kick_index as usize, command))
+            let kick = clique.kick_index as usize;
+            if let Some(command) = command_of_esl.get(&clique.esl_index) {
+                return Some((kick, *command));
+            }
+            let starts = starts_by_kick.get(&kicks.get(kick)?.software_id)?;
+            let position = starts.partition_point(|(start, _)| *start <= clique.start_ticks + guard);
+            let (_, command) = starts.get(position.checked_sub(1)?)?;
+            Some((kick, *command))
         })
         .collect::<Vec<_>>();
 
@@ -1300,19 +1327,9 @@ fn usc_activity(
             (owner, values[values.len() / 2])
         })
         .collect::<BTreeMap<_, _>>();
-    // Command starts per kick, to bound cliques with no measured duration
-    // by the next command's start (dispatches of an encoder mostly run
-    // back to back behind barriers).
-    let mut starts_by_kick = BTreeMap::<u64, Vec<(u64, usize)>>::new();
-    for (index, command) in profile.commands.iter().enumerate() {
-        starts_by_kick
-            .entry(command.software_id)
-            .or_default()
-            .push((command.start_ticks, index));
-    }
-    for starts in starts_by_kick.values_mut() {
-        starts.sort_unstable();
-    }
+    // Cliques with no measured duration are bounded by the next command's
+    // start (dispatches of an encoder mostly run back to back behind
+    // barriers).
 
     let mut activity = Vec::with_capacity(cliques.len());
     for (index, clique) in cliques.iter().enumerate() {

@@ -172,6 +172,8 @@ pub struct ApsWorkClique {
     /// next event on the same clique slot, or the end of the trace.
     pub end_ticks: u64,
     pub kick_index: u32,
+    /// Index of the shader launch on this USC, or `u64::MAX` when the parser
+    /// did not tie the clique to one (most cliques of a long dispatch).
     pub esl_index: u64,
     /// Hardware clique slot; a missing end equal to the next start on the
     /// same slot is a real hand-over, otherwise the slot went idle.
