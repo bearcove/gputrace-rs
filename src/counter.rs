@@ -830,7 +830,13 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     if metrics.is_empty() {
         warnings.push("no normalized GPRWCNTR counter metrics were decoded".to_owned());
     }
-    if !js_variables.is_empty() && derived_metrics.is_empty() {
+    if let Some(generation) = device_identifier.as_deref().and_then(agx_generation)
+        && generation > 14
+    {
+        warnings.push(format!(
+            "the AGX JavaScript derived-counter scripts cover G13/G14 only; this is a G{generation} GPU: use counters.md (agxps, limiter pass)"
+        ));
+    } else if !js_variables.is_empty() && derived_metrics.is_empty() {
         warnings.push("no AGX JavaScript derived counters evaluated to finite values".to_owned());
     }
     if profiler_summary
