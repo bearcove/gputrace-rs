@@ -589,6 +589,29 @@ pub fn report_for_profiler_dir(profiler_dir: &Path) -> Result<HwCounterReport> {
     })
 }
 
+/// The agxps `(generation, variant)` of the GPU a profile was recorded on:
+/// the variant whose core and mGPU counts match the profile's
+/// `Configuration Variables`.
+#[cfg(target_os = "macos")]
+pub fn agxps_gpu_for_profile(profiler_dir: &Path) -> Option<(u32, u32)> {
+    let stream_data = fs::read(profiler_dir.join("streamData")).ok()?;
+    let root = keyed_archive::decode(&stream_data)?;
+    let config = root
+        .get("APSCounterData")?
+        .as_array()?
+        .iter()
+        .filter_map(ArchiveValue::nested)
+        .find_map(|entry| entry.get("Configuration Variables").cloned())?;
+    let generation = config.get("gpu_gen")?.as_u64()? as u32;
+    let num_cores = config.get("num_cores")?.as_u64()?;
+    let num_mgpus = config.get("num_mgpus").and_then(ArchiveValue::as_u64).unwrap_or(1);
+    let api = agxps_sys::counters::counter_api().ok()?;
+    api.variants(generation)
+        .into_iter()
+        .find(|shape| shape.num_cores == num_cores && shape.num_mgpus == num_mgpus)
+        .map(|shape| (generation, shape.variant))
+}
+
 /// The APS_USC counter whose presence in the GRC list switches the parser to
 /// the micro-architectural counter layout
 /// (`agxps_aps_get_uarch_behaviour_from_GRC_counter_list`).

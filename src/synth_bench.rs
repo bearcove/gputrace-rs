@@ -279,6 +279,18 @@ impl CounterOracleKernel {
     }
 }
 
+/// Label of the final oracle encoder, which runs every kernel serially.
+pub const ORACLE_MIXED_ENCODER_LABEL: &str = "oracle_mixed";
+
+#[cfg(target_os = "macos")]
+struct OracleBuffers {
+    copy_src: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    copy_dst: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    read_src: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    small_out: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    read_out: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+}
+
 /// float4 elements per 64 MiB stream buffer.
 pub const ORACLE_STREAM_FLOAT4S: u64 = 4 * 1024 * 1024;
 const ORACLE_STREAM_BYTES: u64 = ORACLE_STREAM_FLOAT4S * 16;
@@ -422,7 +434,9 @@ kernel void oracle_lowocc(device float* out [[buffer(0)]],
 }
 
 /// Capture the counter oracle: every kernel of [`counter_oracle_kernels`] in
-/// its own labelled compute encoder of a single command buffer.
+/// its own labelled compute encoder of a single command buffer, then all of
+/// them again, serially, in one final [`ORACLE_MIXED_ENCODER_LABEL`] encoder
+/// with fresh buffers.
 #[cfg(target_os = "macos")]
 pub fn run_counter_oracle(output: &std::path::Path) -> Result<Vec<CounterOracleKernel>> {
     use objc2::rc::autoreleasepool;
@@ -530,52 +544,91 @@ pub fn run_counter_oracle(output: &std::path::Path) -> Result<Vec<CounterOracleK
                 ))
             })?;
 
+        // The mixed encoder replays every kernel serially in one encoder, on
+        // its own stream buffers, so per-dispatch attribution inside an
+        // encoder can be checked against the single-kernel encoders.
+        let mixed = OracleBuffers {
+            copy_src: alloc(ORACLE_STREAM_BYTES, 6)?,
+            copy_dst: alloc(ORACLE_STREAM_BYTES, 7)?,
+            read_src: alloc(ORACLE_STREAM_BYTES, 8)?,
+            small_out: alloc(160 * 1024 * 4, 9)?,
+            read_out: alloc(ORACLE_STREAM_FLOAT4S / ORACLE_READ_PER_THREAD * 4, 10)?,
+        };
+        let single = OracleBuffers {
+            copy_src,
+            copy_dst,
+            read_src,
+            small_out,
+            read_out,
+        };
         let cmd_buf = queue
             .commandBuffer()
             .ok_or(Error::Unsupported("failed to create MTLCommandBuffer"))?;
-        for (kernel, pipeline) in kernels.iter().zip(pipelines.iter()) {
+        let encode = |label: &str,
+                      dispatches: &mut dyn Iterator<
+            Item = (
+                &CounterOracleKernel,
+                &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+            ),
+        >,
+                      buffers: &OracleBuffers| {
             let encoder = cmd_buf.computeCommandEncoder().ok_or(Error::Unsupported(
                 "failed to create MTLComputeCommandEncoder",
             ))?;
-            encoder.setLabel(Some(&NSString::from_str(kernel.encoder_label)));
-            encoder.setComputePipelineState(pipeline);
-            let set = |buffer: &ProtocolObject<dyn MTLBuffer>, index: usize| unsafe {
-                encoder.setBuffer_offset_atIndex(Some(buffer), 0, index);
-            };
-            match kernel.function_name {
-                "oracle_copy" => {
-                    set(&copy_src, 0);
-                    set(&copy_dst, 1);
+            encoder.setLabel(Some(&NSString::from_str(label)));
+            for (kernel, pipeline) in dispatches {
+                encoder.setComputePipelineState(pipeline);
+                let set = |buffer: &ProtocolObject<dyn MTLBuffer>, index: usize| unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(buffer), 0, index);
+                };
+                match kernel.function_name {
+                    "oracle_copy" => {
+                        set(&buffers.copy_src, 0);
+                        set(&buffers.copy_dst, 1);
+                    }
+                    "oracle_read" => {
+                        set(&buffers.read_src, 0);
+                        set(&buffers.read_out, 1);
+                    }
+                    _ => set(&buffers.small_out, 0),
                 }
-                "oracle_read" => {
-                    set(&read_src, 0);
-                    set(&read_out, 1);
+                if matches!(kernel.function_name, "oracle_alu" | "oracle_lowocc") {
+                    unsafe {
+                        encoder.setBytes_length_atIndex(
+                            std::ptr::NonNull::from(&k).cast(),
+                            std::mem::size_of::<f32>(),
+                            1,
+                        );
+                    }
                 }
-                _ => set(&small_out, 0),
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: kernel.threadgroups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: kernel.threads_per_group as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
             }
-            if matches!(kernel.function_name, "oracle_alu" | "oracle_lowocc") {
-                unsafe {
-                    encoder.setBytes_length_atIndex(
-                        std::ptr::NonNull::from(&k).cast(),
-                        std::mem::size_of::<f32>(),
-                        1,
-                    );
-                }
-            }
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: kernel.threadgroups as usize,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: kernel.threads_per_group as usize,
-                    height: 1,
-                    depth: 1,
-                },
-            );
             encoder.endEncoding();
+            Ok::<_, Error>(())
+        };
+        for (kernel, pipeline) in kernels.iter().zip(pipelines.iter()) {
+            encode(
+                kernel.encoder_label,
+                &mut std::iter::once((kernel, pipeline)),
+                &single,
+            )?;
         }
+        encode(
+            ORACLE_MIXED_ENCODER_LABEL,
+            &mut kernels.iter().zip(pipelines.iter()),
+            &mixed,
+        )?;
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
         capture_manager.stopCapture();
@@ -590,7 +643,7 @@ pub fn run_counter_oracle(_output: &std::path::Path) -> Result<Vec<CounterOracle
 
 pub fn format_counter_oracle_plan(kernels: &[CounterOracleKernel]) -> String {
     let mut out = String::from(
-        "Counter oracle plan (one kernel per compute encoder)\n\
+        "Counter oracle plan (one kernel per compute encoder, then all kernels in oracle_mixed)\n\
          encoder        threads    dev_read_B  dev_write_B  fma/thread  intent\n",
     );
     for kernel in kernels {

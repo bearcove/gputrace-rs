@@ -6034,8 +6034,12 @@ mod platform {
 
         let loaded = agxps_sys::load()
             .map_err(|error| Error::InvalidInput(format!("agxps load failed: {error}")))?;
-        let generation = u32_env("AGXPS_GEN", 16);
-        let variant = u32_env("AGXPS_VARIANT", 3);
+        // The profile says which GPU it was recorded on; AGXPS_GEN /
+        // AGXPS_VARIANT only override that for experiments.
+        let (profile_generation, profile_variant) =
+            crate::hw_counters::agxps_gpu_for_profile(profiler_directory).unwrap_or((16, 5));
+        let generation = u32_env("AGXPS_GEN", profile_generation);
+        let variant = u32_env("AGXPS_VARIANT", profile_variant);
         let rev = u32_env("AGXPS_REV", 1);
         let mut groups = BTreeMap::<(usize, u64), XcodeMioPipelineAgxpsTraceCost>::new();
 
