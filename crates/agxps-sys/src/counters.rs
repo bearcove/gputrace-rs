@@ -85,6 +85,14 @@ type FnPdPtrRange = unsafe extern "C" fn(*mut c_void, *mut *const u64, u64, u64)
 type FnPdNumRange = unsafe extern "C" fn(*mut c_void, *mut u64, u64, u64) -> i32;
 type FnPdSystemTimestamp = unsafe extern "C" fn(*mut c_void, u64) -> u64;
 type FnParseErrorString = unsafe extern "C" fn(u64) -> *const c_char;
+type FnPdCount64 = unsafe extern "C" fn(*mut c_void) -> u64;
+type FnPdRange32 = unsafe extern "C" fn(*mut c_void, *mut u32, u64, u64) -> i32;
+type FnPdRange8 = unsafe extern "C" fn(*mut c_void, *mut u8, u64, u64) -> i32;
+type FnAnalyzerCreate = unsafe extern "C" fn(u32) -> *mut c_void;
+type FnAnalyzerVoid = unsafe extern "C" fn(*mut c_void);
+type FnAnalyzerProcess = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type FnAnalyzerCount = unsafe extern "C" fn(*mut c_void, u32) -> u64;
+type FnAnalyzerRange = unsafe extern "C" fn(*mut c_void, u32, *mut u64, u64, u64) -> i32;
 
 /// `agxps_aps_descriptor_t` as `-[XRGPUAPSDataProcessor setConfig:]` fills it
 /// from the profile's `APS Options`. Getting `count_period` wrong (the old
@@ -133,7 +141,38 @@ pub struct ApsCounterProfile {
     pub sample_end_ticks: Vec<u64>,
     /// USC clock cycles covered by each sample (0 for the first sample).
     pub sample_cycles: Vec<u64>,
+    /// Every kick in the stream, in the parser's order (work cliques refer
+    /// to kicks by index into this list).
     pub kicks: Vec<ApsKick>,
+    /// Commands (dispatches) the timing analyzer found on this USC, in its
+    /// order. Within one kick, the n-th command is the work clique `esl_id`
+    /// n.
+    pub commands: Vec<ApsCommand>,
+    pub work_cliques: Vec<ApsWorkClique>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ApsCommand {
+    pub software_id: u64,
+    /// Address of the dispatch's shader-launch program; matches the
+    /// `compute-sl` entries of `Program Address Mappings`.
+    pub esl_shader_address: u64,
+    pub start_ticks: u64,
+}
+
+/// One clique (a batch of threadgroups) of a dispatch running on a USC.
+#[derive(Debug, Clone, Copy)]
+pub struct ApsWorkClique {
+    pub start_ticks: u64,
+    /// When the profile traces no clique ends (`missing_end`), this is the
+    /// next event on the same clique slot, or the end of the trace.
+    pub end_ticks: u64,
+    pub kick_index: u32,
+    pub esl_index: u64,
+    /// Hardware clique slot; a missing end equal to the next start on the
+    /// same slot is a real hand-over, otherwise the slot went idle.
+    pub slot: u8,
+    pub missing_end: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,6 +253,21 @@ pub struct CounterApi {
     pd_sync_ts: FnPdRange,
     pd_system_timestamp: FnPdSystemTimestamp,
     parse_error_string: FnParseErrorString,
+    pd_cliques_num: FnPdCount64,
+    pd_clique_start: FnPdRange,
+    pd_clique_end: FnPdRange,
+    pd_clique_esl_id: FnPdRange,
+    pd_clique_kick_id: FnPdRange32,
+    pd_clique_missing_end: FnPdRange8,
+    pd_clique_slot: FnPdRange8,
+    analyzer_create: FnAnalyzerCreate,
+    analyzer_destroy: FnAnalyzerVoid,
+    analyzer_process_usc: FnAnalyzerProcess,
+    analyzer_finish: FnAnalyzerVoid,
+    analyzer_num_commands: FnAnalyzerCount,
+    analyzer_esl_address: FnAnalyzerRange,
+    analyzer_esl_start: FnAnalyzerRange,
+    analyzer_kick_software_id: FnAnalyzerRange,
     /// `(generation, variant)` the process-global counter table was built for.
     initialized: Mutex<Option<(u32, u32)>>,
 }
@@ -288,6 +342,21 @@ impl CounterApi {
             pd_sync_ts: s!("agxps_aps_profile_data_get_synchronized_timestamps"),
             pd_system_timestamp: s!("agxps_aps_profile_data_get_system_timestamp"),
             parse_error_string: s!("agxps_aps_parse_error_type_to_string"),
+            pd_cliques_num: s!("agxps_aps_profile_data_get_work_cliques_num"),
+            pd_clique_start: s!("agxps_aps_profile_data_get_work_clique_start"),
+            pd_clique_end: s!("agxps_aps_profile_data_get_work_clique_end"),
+            pd_clique_esl_id: s!("agxps_aps_profile_data_get_work_clique_esl_id"),
+            pd_clique_kick_id: s!("agxps_aps_profile_data_get_work_clique_kick_id"),
+            pd_clique_missing_end: s!("agxps_aps_profile_data_get_work_clique_missing_end"),
+            pd_clique_slot: s!("agxps_aps_profile_data_get_work_clique_clique_id"),
+            analyzer_create: s!("agxps_aps_timing_analyzer_create"),
+            analyzer_destroy: s!("agxps_aps_timing_analyzer_destroy"),
+            analyzer_process_usc: s!("agxps_aps_timing_analyzer_process_usc"),
+            analyzer_finish: s!("agxps_aps_timing_analyzer_finish"),
+            analyzer_num_commands: s!("agxps_aps_timing_analyzer_get_num_commands"),
+            analyzer_esl_address: s!("agxps_aps_timing_analyzer_get_esl_shader_address"),
+            analyzer_esl_start: s!("agxps_aps_timing_analyzer_get_esl_start"),
+            analyzer_kick_software_id: s!("agxps_aps_timing_analyzer_get_kick_software_id"),
             initialized: Mutex::new(None),
         })
     }
@@ -691,13 +760,79 @@ impl CounterGpu<'_> {
             })
             .collect();
 
+        let clique_count = unsafe { (api.pd_cliques_num)(pd) } as usize;
+        let mut clique_starts = vec![0u64; clique_count];
+        let mut clique_ends = vec![0u64; clique_count];
+        let mut clique_esl = vec![0u64; clique_count];
+        let mut clique_kick = vec![0u32; clique_count];
+        let mut clique_missing = vec![0u8; clique_count];
+        let mut clique_slot = vec![0u8; clique_count];
+        if clique_count > 0 {
+            let n = clique_count as u64;
+            unsafe {
+                (api.pd_clique_start)(pd, clique_starts.as_mut_ptr(), 0, n);
+                (api.pd_clique_end)(pd, clique_ends.as_mut_ptr(), 0, n);
+                (api.pd_clique_esl_id)(pd, clique_esl.as_mut_ptr(), 0, n);
+                (api.pd_clique_kick_id)(pd, clique_kick.as_mut_ptr(), 0, n);
+                (api.pd_clique_missing_end)(pd, clique_missing.as_mut_ptr(), 0, n);
+                (api.pd_clique_slot)(pd, clique_slot.as_mut_ptr(), 0, n);
+            }
+        }
+        let work_cliques = (0..clique_count)
+            .map(|index| ApsWorkClique {
+                start_ticks: unsafe { (api.pd_system_timestamp)(pd, clique_starts[index]) },
+                end_ticks: unsafe { (api.pd_system_timestamp)(pd, clique_ends[index]) },
+                kick_index: clique_kick[index],
+                esl_index: clique_esl[index],
+                slot: clique_slot[index],
+                missing_end: clique_missing[index] != 0,
+            })
+            .collect();
+
         ApsCounterProfile {
             counter_names,
             values,
             sample_end_ticks,
             sample_cycles,
             kicks,
+            commands: unsafe { self.timing_commands(pd) },
+            work_cliques,
         }
+    }
+
+    /// Run the agxps timing analyzer over one USC stream and return its
+    /// per-command records.
+    unsafe fn timing_commands(&self, pd: *mut c_void) -> Vec<ApsCommand> {
+        const KIND: u32 = 1;
+        let api = self.api;
+        let analyzer = unsafe { (api.analyzer_create)(KIND) };
+        if analyzer.is_null() {
+            return Vec::new();
+        }
+        unsafe {
+            (api.analyzer_process_usc)(analyzer, pd);
+            (api.analyzer_finish)(analyzer);
+        }
+        let count = unsafe { (api.analyzer_num_commands)(analyzer, KIND) } as usize;
+        let mut addresses = vec![0u64; count];
+        let mut starts = vec![0u64; count];
+        let mut software_ids = vec![0u64; count];
+        if count > 0 {
+            let n = count as u64;
+            unsafe {
+                (api.analyzer_esl_address)(analyzer, KIND, addresses.as_mut_ptr(), 0, n);
+                (api.analyzer_esl_start)(analyzer, KIND, starts.as_mut_ptr(), 0, n);
+                (api.analyzer_kick_software_id)(analyzer, KIND, software_ids.as_mut_ptr(), 0, n);
+            }
+        }
+        unsafe { (api.analyzer_destroy)(analyzer) };
+        (0..count)
+            .map(|index| ApsCommand {
+                software_id: software_ids[index],
+                esl_shader_address: addresses[index],
+                start_ticks: starts[index],
+            })
+            .collect()
     }
 }
 
